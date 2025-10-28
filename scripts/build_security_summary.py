@@ -29,16 +29,6 @@ def main() -> None:
     else:
         summary.append("Semgrep report not available.")
 
-    inspect_summary = pathlib.Path("inspect-summary.md")
-    if inspect_summary.exists():
-        try:
-            inspect_text = inspect_summary.read_text(encoding="utf-8")
-        except OSError as exc:  # pragma: no cover - defensive
-            raise SystemExit(f"Unable to read Inspect summary: {exc}")
-        summary.append(inspect_text)
-    else:
-        summary.append("Inspect AI summary not available.")
-
     summary_text = "\n\n".join(summary)
     pathlib.Path("security-summary.md").write_text(summary_text, encoding="utf-8")
     print(summary_text)

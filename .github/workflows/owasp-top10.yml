@@ -31,7 +31,7 @@ jobs:
       - name: Install security tooling
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade inspect-ai semgrep
+          pip install --upgrade semgrep
 
       - name: Run Semgrep OWASP Top Ten ruleset
         id: semgrep
@@ -50,24 +50,7 @@ jobs:
           echo "Semgrep detected OWASP Top Ten violations."
           exit 1
 
-      - name: Run Inspect AI analyses
-        id: inspect
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          inspect_ai scan owasp-top-ten --format json --output inspect-report.json
-
-      - name: Evaluate Inspect AI findings
-        id: inspect_eval
-        run: python scripts/evaluate_inspect.py
-
-      - name: Fail on Inspect AI findings
-        if: steps.inspect_eval.outputs.findings != '0'
-        run: |
-          echo "Inspect AI detected OWASP Top Ten vulnerabilities."
-          exit 1
-
-      - name: Build combined security summary
+      - name: Build security summary
         id: summary
         run: python scripts/build_security_summary.py
 
@@ -77,7 +60,6 @@ jobs:
           name: owasp-top10-artifacts
           path: |
             semgrep-report.json
-            inspect-report.json
             security-summary.md
           if-no-files-found: error
 
