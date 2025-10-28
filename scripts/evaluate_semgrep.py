@@ -15,8 +15,12 @@ def main() -> None:
         print("Semgrep report not found.", file=sys.stderr)
         sys.exit(1)
 
-    with report_path.open(encoding="utf-8") as fp:
-        data = json.load(fp)
+    try:
+        with report_path.open(encoding="utf-8") as fp:
+            data = json.load(fp)
+    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+        print(f"Unable to parse Semgrep report: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     findings = len(data.get("results", []))
     print(f"Semgrep findings: {findings}")

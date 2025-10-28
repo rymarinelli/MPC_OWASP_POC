@@ -12,7 +12,11 @@ def main() -> None:
 
     semgrep_report = pathlib.Path("semgrep-report.json")
     if semgrep_report.exists():
-        data = json.loads(semgrep_report.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(semgrep_report.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            raise SystemExit(f"Unable to parse Semgrep summary JSON: {exc}")
+
         results = data.get("results", [])
         summary.append("### Semgrep OWASP Top Ten")
         summary.append(f"Total findings: {len(results)}")
@@ -27,7 +31,11 @@ def main() -> None:
 
     inspect_summary = pathlib.Path("inspect-summary.md")
     if inspect_summary.exists():
-        summary.append(inspect_summary.read_text(encoding="utf-8"))
+        try:
+            inspect_text = inspect_summary.read_text(encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - defensive
+            raise SystemExit(f"Unable to read Inspect summary: {exc}")
+        summary.append(inspect_text)
     else:
         summary.append("Inspect AI summary not available.")
 
