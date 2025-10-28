@@ -1,0 +1,155 @@
+rules:
+  - id: owasp-top10-a03-command-injection
+    languages: [python]
+    message: "Avoid invoking shells with untrusted input; prefer subprocess without shell=True or use shlex.quote."
+    severity: ERROR
+    metadata:
+      category: OWASP A03: Injection
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.$FUNC(..., shell=True, ...)
+          - pattern: os.system(...)
+          - pattern: os.popen(...)
+          - pattern: eval(...)
+          - pattern: exec(...)
+    fix: "Use subprocess.run([...]) with shell=False and validated arguments."
+
+  - id: owasp-top10-a03-sql-injection
+    languages: [python]
+    message: "Detected SQL query constructed with string interpolation; use parameterized queries."
+    severity: ERROR
+    metadata:
+      category: OWASP A03: Injection
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern-either:
+          - pattern: $DB.execute(f"$QUERY{...}")
+          - pattern: $DB.execute($Q1 + $Q2, ...)
+          - pattern: $DB.execute("...%s..." % ...)
+    fix: "Pass parameters separately, e.g., cursor.execute('SELECT ... WHERE id=%s', (param,))."
+
+  - id: owasp-top10-a02-hardcoded-secret
+    languages: [python]
+    message: "Hard-coded secret detected; move credentials to environment variables or secret stores."
+    severity: WARNING
+    metadata:
+      category: OWASP A02: Cryptographic Failures
+      owasp: "A02:2021 - Cryptographic Failures"
+    pattern: $VAR = "..."
+    metavariable-pattern:
+      metavariable: $VAR
+      pattern: /(?i)(password|passwd|secret|token|apikey|api_key|auth|credential).*/
+
+  - id: owasp-top10-a02-insecure-transport
+    languages: [python]
+    message: "requests call disables TLS verification; enable certificate validation."
+    severity: ERROR
+    metadata:
+      category: OWASP A02: Cryptographic Failures
+      owasp: "A02:2021 - Cryptographic Failures"
+    pattern: requests.$FUNC(..., verify=False, ...)
+    fix: "Remove verify=False or supply a CA bundle."
+
+  - id: owasp-top10-a05-debug-enabled
+    languages: [python]
+    message: "Debug mode is enabled; disable debug in production deployments."
+    severity: WARNING
+    metadata:
+      category: OWASP A05: Security Misconfiguration
+      owasp: "A05:2021 - Security Misconfiguration"
+    patterns:
+      - pattern-either:
+          - pattern: app.debug = True
+          - pattern: app.run(..., debug=True, ...)
+          - pattern: Flask(__name__, ..., debug=True, ...)
+
+  - id: owasp-top10-a08-insecure-yaml-deserialization
+    languages: [python]
+    message: "yaml.load used without a safe loader; use safe_load or specify Loader=SafeLoader."
+    severity: ERROR
+    metadata:
+      category: OWASP A08: Software and Data Integrity Failures
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=..., ...)
+      - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+    fix: yaml.safe_load(...)
+
+  - id: owasp-top10-a08-pickle-deserialization
+    languages: [python]
+    message: "Avoid using pickle for untrusted data; prefer safer serialization formats."
+    severity: ERROR
+    metadata:
+      category: OWASP A08: Software and Data Integrity Failures
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+
+  - id: owasp-top10-a02-weak-hash
+    languages: [python]
+    message: "Weak cryptographic hash detected; use SHA-256 or stronger."
+    severity: WARNING
+    metadata:
+      category: OWASP A02: Cryptographic Failures
+      owasp: "A02:2021 - Cryptographic Failures"
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+
+  - id: owasp-top10-a05-insecure-tempfile
+    languages: [python]
+    message: "tempfile.mktemp is insecure; use NamedTemporaryFile or mkstemp instead."
+    severity: ERROR
+    metadata:
+      category: OWASP A05: Security Misconfiguration
+      owasp: "A05:2021 - Security Misconfiguration"
+    pattern: tempfile.mktemp(...)
+
+  - id: owasp-top10-a07-jwt-without-verify
+    languages: [python]
+    message: "JWT decode without verification; supply verify=True or algorithms."
+    severity: ERROR
+    metadata:
+      category: OWASP A07: Identification and Authentication Failures
+      owasp: "A07:2021 - Identification and Authentication Failures"
+    pattern: jwt.decode(..., verify=False, ...)
+
+  - id: owasp-top10-a09-broad-except
+    languages: [python]
+    message: "Broad exception handler hides failures; catch specific exceptions."
+    severity: WARNING
+    metadata:
+      category: OWASP A09: Security Logging and Monitoring Failures
+      owasp: "A09:2021 - Security Logging and Monitoring Failures"
+    pattern: |
+      try:
+        ...
+      except Exception:
+        ...
+
+  - id: owasp-top10-a01-overly-broad-cors
+    languages: [python]
+    message: "CORS headers allow all origins; restrict to trusted domains."
+    severity: WARNING
+    metadata:
+      category: OWASP A01: Broken Access Control
+      owasp: "A01:2021 - Broken Access Control"
+    pattern-either:
+      - pattern: response.headers["Access-Control-Allow-Origin"] = "*"
+      - pattern: response.headers['Access-Control-Allow-Origin'] = '*'
+
+  - id: owasp-top10-a10-ssrf-user-input
+    languages: [python]
+    message: "User-controlled data flows into an outbound request; validate destinations to prevent SSRF."
+    severity: ERROR
+    metadata:
+      category: OWASP A10: Server-Side Request Forgery
+      owasp: "A10:2021 - Server-Side Request Forgery"
+    patterns:
+      - pattern: requests.$FUNC($URL, ...)
+      - metavariable-pattern:
+          metavariable: $URL
+          pattern: /(request\.(args|get_json\(\)|form|headers|values)\..*|request\.(args|get_json\(\)|form|values)\[['\"])/
