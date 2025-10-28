@@ -42,7 +42,11 @@ jobs:
       - name: Deploy sandbox workloads into Minikube
         run: |
           set -euo pipefail
-          kubectl version --output=yaml
+          # The kubectl client bundled with the GitHub Actions runner can be a few minor
+          # releases ahead of the Minikube cluster version we provision. Querying only
+          # the client metadata avoids the "version skew" non-zero exit status while
+          # still surfacing useful diagnostic details in the logs.
+          kubectl version --client --output=yaml
           mkdir -p workloads/manifests
           index_file="workloads/index.html"
           curl -fsSL https://k8s-sandbox.aisi.org.uk/examples/ -o "$index_file"
