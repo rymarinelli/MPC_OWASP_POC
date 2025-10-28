@@ -31,37 +31,7 @@ jobs:
       - name: Install security tooling
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade inspect-ai semgrep
-
-      - name: Start Minikube cluster
-        uses: medyagh/setup-minikube@latest
-        with:
-          driver: docker
-          kubernetes-version: v1.30.0
-
-      - name: Deploy sandbox workloads into Minikube
-        run: |
-          set -euo pipefail
-          kubectl version --output=yaml
-          mkdir -p workloads/manifests
-          index_file="workloads/index.html"
-          curl -fsSL https://k8s-sandbox.aisi.org.uk/examples/ -o "$index_file"
-          grep -oE 'href="[^"]+\.ya?ml"' "$index_file" | sed -E 's/^href="//;s/"$//' | sort -u > workloads/manifest-list.txt
-          if [ ! -s workloads/manifest-list.txt ]; then
-            echo "No manifests discovered at https://k8s-sandbox.aisi.org.uk/examples/." >&2
-            exit 1
-          fi
-          while IFS= read -r manifest_path; do
-            manifest_dir=$(dirname "$manifest_path")
-            target_dir="workloads/manifests/$manifest_dir"
-            mkdir -p "$target_dir"
-            manifest_url="https://k8s-sandbox.aisi.org.uk/examples/$manifest_path"
-            manifest_file="$target_dir/$(basename "$manifest_path")"
-            echo "Downloading $manifest_url"
-            curl -fsSL "$manifest_url" -o "$manifest_file"
-            kubectl apply -f "$manifest_file"
-          done < workloads/manifest-list.txt
-          kubectl get all --all-namespaces
+          pip install --upgrade semgrep
 
       - name: Run Semgrep OWASP Top Ten ruleset
         id: semgrep
@@ -72,26 +42,7 @@ jobs:
 
       - name: Evaluate Semgrep findings
         id: semgrep_eval
-        run: |
-          python <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-report_path = pathlib.Path('semgrep-report.json')
-if not report_path.exists():
-    print('Semgrep report not found.', file=sys.stderr)
-    sys.exit(1)
-
-with report_path.open() as fp:
-    data = json.load(fp)
-
-findings = len(data.get('results', []))
-print(f"Semgrep findings: {findings}")
-with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
-    fh.write(f"findings={findings}\n")
-PY
+        run: python scripts/evaluate_semgrep.py
 
       - name: Fail on Semgrep findings
         if: steps.semgrep_eval.outputs.findings != '0'
@@ -99,99 +50,9 @@ PY
           echo "Semgrep detected OWASP Top Ten violations."
           exit 1
 
-      - name: Run Inspect AI analyses
-        id: inspect
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          inspect_ai scan owasp-top-ten --format json --output inspect-report.json
-
-      - name: Evaluate Inspect AI findings
-        id: inspect_eval
-        run: |
-          python <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-report_path = pathlib.Path('inspect-report.json')
-if not report_path.exists():
-    print('Inspect AI report not found.', file=sys.stderr)
-    sys.exit(1)
-
-try:
-    with report_path.open() as fp:
-        data = json.load(fp)
-except json.JSONDecodeError as exc:
-    print(f'Unable to parse Inspect AI report: {exc}', file=sys.stderr)
-    sys.exit(1)
-
-findings_list = []
-
-def walk(node):
-    if isinstance(node, dict):
-        if any(key in node for key in ('severity', 'impact', 'priority')) and any(key in node for key in ('title', 'rule_id', 'description')):
-            findings_list.append(node)
-        for value in node.values():
-            walk(value)
-    elif isinstance(node, list):
-        for item in node:
-            walk(item)
-
-walk(data)
-findings = len(findings_list)
-print(f"Inspect AI findings: {findings}")
-with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
-    fh.write(f"findings={findings}\n")
-
-summary_lines = ['### Inspect AI Findings', f'Total findings: {findings}']
-for finding in findings_list[:10]:
-    severity = finding.get('severity') or finding.get('impact') or 'unknown'
-    title = finding.get('title') or finding.get('rule_id') or 'untitled finding'
-    summary_lines.append(f"- **{severity}** {title}")
-pathlib.Path('inspect-summary.md').write_text("\n".join(summary_lines), encoding='utf-8')
-PY
-
-      - name: Fail on Inspect AI findings
-        if: steps.inspect_eval.outputs.findings != '0'
-        run: |
-          echo "Inspect AI detected OWASP Top Ten vulnerabilities."
-          exit 1
-
-      - name: Build combined security summary
+      - name: Build security summary
         id: summary
-        run: |
-          python <<'PY'
-import json
-import pathlib
-
-summary = []
-semgrep_report = pathlib.Path('semgrep-report.json')
-if semgrep_report.exists():
-    data = json.loads(semgrep_report.read_text())
-    results = data.get('results', [])
-    summary.append('### Semgrep OWASP Top Ten')
-    summary.append(f'Total findings: {len(results)}')
-    for result in results[:10]:
-        severity = result.get('extra', {}).get('severity', 'UNKNOWN')
-        rule_id = result.get('check_id', 'rule')
-        path = result.get('path')
-        line = result.get('start', {}).get('line')
-        summary.append(f'- **{severity}** `{rule_id}` at {path}:{line}')
-else:
-    summary.append('Semgrep report not available.')
-
-inspect_summary = pathlib.Path('inspect-summary.md')
-if inspect_summary.exists():
-    summary.append(inspect_summary.read_text())
-else:
-    summary.append('Inspect AI summary not available.')
-
-summary_text = '\n\n'.join(summary)
-pathlib.Path('security-summary.md').write_text(summary_text, encoding='utf-8')
-print(summary_text)
-PY
+        run: python scripts/build_security_summary.py
 
       - name: Upload security artifacts
         uses: actions/upload-artifact@v4
@@ -199,9 +60,7 @@ PY
           name: owasp-top10-artifacts
           path: |
             semgrep-report.json
-            inspect-report.json
             security-summary.md
-            workloads/
           if-no-files-found: error
 
       - name: Comment on pull request with findings
