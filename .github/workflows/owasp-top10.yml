@@ -33,39 +33,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade inspect-ai semgrep
 
-      - name: Start Minikube cluster
-        uses: medyagh/setup-minikube@latest
-        with:
-          driver: docker
-          kubernetes-version: v1.30.0
-
-      - name: Deploy sandbox workloads into Minikube
-        run: |
-          set -euo pipefail
-          # The kubectl client bundled with the GitHub Actions runner can be newer than
-          # the Minikube control plane. Requesting only the client metadata avoids
-          # version skew errors while still confirming the binary is available.
-          kubectl version --client --output=yaml
-          mkdir -p workloads/manifests
-          index_file="workloads/index.html"
-          curl -fsSL https://k8s-sandbox.aisi.org.uk/examples/ -o "$index_file"
-          grep -oE 'href="[^"]+\.ya?ml"' "$index_file" | sed -E 's/^href="//;s/"$//' | sort -u > workloads/manifest-list.txt
-          if [ ! -s workloads/manifest-list.txt ]; then
-            echo "No manifests discovered at https://k8s-sandbox.aisi.org.uk/examples/." >&2
-            exit 1
-          fi
-          while IFS= read -r manifest_path; do
-            manifest_dir=$(dirname "$manifest_path")
-            target_dir="workloads/manifests/$manifest_dir"
-            mkdir -p "$target_dir"
-            manifest_url="https://k8s-sandbox.aisi.org.uk/examples/$manifest_path"
-            manifest_file="$target_dir/$(basename "$manifest_path")"
-            echo "Downloading $manifest_url"
-            curl -fsSL "$manifest_url" -o "$manifest_file"
-            kubectl apply -f "$manifest_file"
-          done < workloads/manifest-list.txt
-          kubectl get all --all-namespaces
-
       - name: Run Semgrep OWASP Top Ten ruleset
         id: semgrep
         continue-on-error: true
@@ -112,7 +79,6 @@ jobs:
             semgrep-report.json
             inspect-report.json
             security-summary.md
-            workloads/
           if-no-files-found: error
 
       - name: Comment on pull request with findings
