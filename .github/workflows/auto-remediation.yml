@@ -1,0 +1,61 @@
+name: Automated Remediation
+
+on:
+  workflow_run:
+    workflows:
+      - Security Scan
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-remediate:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' && vars.AUTO_REMEDIATE == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download scan results
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download ${{ github.event.workflow_run.id }} --name scan-results --dir ./artifacts || true
+          if [ ! -f ./artifacts/scan-results.json ]; then
+            echo "No scan results found; skipping remediation"
+            exit 0
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run MCP auto-refactor
+        env:
+          MCP_LLM_ENDPOINT: ${{ secrets.MCP_LLM_ENDPOINT }}
+          MCP_LLM_MODEL: ${{ secrets.MCP_LLM_MODEL }}
+          MCP_LLM_API_KEY: ${{ secrets.MCP_LLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_BASE_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          python scripts/auto_refactor.py \
+            --scan-results artifacts/scan-results.json \
+            --validate "pytest" \
+            --formatter "black {path}"
