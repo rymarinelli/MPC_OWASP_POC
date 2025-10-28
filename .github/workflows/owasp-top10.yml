@@ -42,15 +42,10 @@ jobs:
       - name: Deploy sandbox workloads into Minikube
         run: |
           set -euo pipefail
-          # The kubectl client bundled with the GitHub Actions runner can be a few minor
-          # releases ahead of the Minikube cluster version we provision, which causes
-          # "version skew" errors. Try the full version output first so we capture
-          # both client and server metadata for diagnostics, then fall back to the
-          # client details if the server call fails.
-          if ! kubectl version --output=yaml; then
-            echo "kubectl version --output=yaml failed; showing client version only." >&2
-            kubectl version --client --output=yaml
-          fi
+          # The kubectl client bundled with the GitHub Actions runner can be newer than
+          # the Minikube control plane. Requesting only the client metadata avoids
+          # version skew errors while still confirming the binary is available.
+          kubectl version --client --output=yaml
           mkdir -p workloads/manifests
           index_file="workloads/index.html"
           curl -fsSL https://k8s-sandbox.aisi.org.uk/examples/ -o "$index_file"
