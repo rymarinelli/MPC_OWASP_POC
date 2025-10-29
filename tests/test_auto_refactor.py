@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 from mcp import AppliedPatch, PatchCandidate, Vulnerability
-from scripts.auto_refactor import build_pr_body, stage_and_commit
+from mcp.remediation import build_pr_body, stage_and_commit
 
 
 class StageAndCommitTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class StageAndCommitTests(unittest.TestCase):
         file_path = self.repo_root / "example.txt"
         file_path.write_text("original contents\n", encoding="utf-8")
 
-        with self.assertLogs("scripts.auto_refactor", level="INFO") as logs:
+        with self.assertLogs("mcp.remediation", level="INFO") as logs:
             stage_and_commit(self.repo_root, [file_path], "test commit")
 
         self.assertTrue(

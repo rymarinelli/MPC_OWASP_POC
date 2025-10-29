@@ -125,3 +125,18 @@ pip install -r requirements.txt
 
 Run the auto-refactor script locally with `--dry-run` to inspect generated
 changes without touching remotes.
+
+## MCP remediation server
+
+For remote automation scenarios the repository also exposes a FastAPI server in
+`mcp/server.py`. Start it locally with:
+
+```bash
+uvicorn mcp.server:app --reload
+```
+
+Submit a `POST /remediate` request containing the vulnerability payload,
+repository coordinates, and language model configuration to trigger the same
+pipeline used by the CLI. The server clones the requested repository, applies
+LLM-generated patches, optionally validates the results, and—when not run in
+`dry_run` mode—pushes a branch before opening a pull request via the GitHub API.
