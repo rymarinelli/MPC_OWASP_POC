@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
 from .patch_generator import PatchCandidate, PatchGenerator
 from .scan_parser import Vulnerability
+
+
+@dataclass
+class AppliedPatch:
+    """Represents a patch that has been written to the repository."""
+
+    candidate: PatchCandidate
+    path: Path
 
 
 class AutoRemediationPipeline:
@@ -33,11 +42,11 @@ class AutoRemediationPipeline:
             patches.append(candidates[0])
         return patches
 
-    def apply(self, patches: Iterable[PatchCandidate]) -> List[Path]:
-        applied: List[Path] = []
+    def apply(self, patches: Iterable[PatchCandidate]) -> List[AppliedPatch]:
+        applied: List[AppliedPatch] = []
         for patch in patches:
             applied_path = patch.write_to_repo(self.repo_root)
-            applied.append(applied_path)
+            applied.append(AppliedPatch(candidate=patch, path=applied_path))
         return applied
 
     def validate(self) -> None:
@@ -46,7 +55,7 @@ class AutoRemediationPipeline:
                 continue
             subprocess.run(command, cwd=self.repo_root, check=True)
 
-    def run(self, vulnerabilities: Iterable[Vulnerability]) -> List[Path]:
+    def run(self, vulnerabilities: Iterable[Vulnerability]) -> List[AppliedPatch]:
         patches = self.plan(vulnerabilities)
         if not patches:
             return []
@@ -55,4 +64,4 @@ class AutoRemediationPipeline:
         return applied
 
 
-__all__ = ["AutoRemediationPipeline"]
+__all__ = ["AutoRemediationPipeline", "AppliedPatch"]

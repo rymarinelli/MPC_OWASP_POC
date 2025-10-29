@@ -62,6 +62,11 @@ Set the following secrets and variables before enabling the workflow:
 | `MCP_LLM_API_KEY` | secret | API key or token for the LLM service. |
 | `GITHUB_TOKEN` | secret | Token with `contents`/`pull_request` scopes (the default Actions token is sufficient). |
 
+When the hosted secrets are absent the workflow automatically installs [Ollama](https://ollama.com/) inside the
+GitHub Actions runner, launches a local inference server, and pulls the `qwen2.5-coder:3b` model. The local server
+exposes an OpenAI-compatible API that the remediation pipeline uses to draft fixes and provide additional
+recommendations inside the pull request body.
+
 Optional repository variables can provide additional guardrails:
 
 * `MCP_FORMATTER` – default formatter template (e.g. `black {path}`) if not
