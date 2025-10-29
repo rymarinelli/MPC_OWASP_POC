@@ -6,7 +6,7 @@ from .prompt_builder import PromptContext
 from .patch_generator import PatchCandidate, PatchGenerator
 from .llm_client import LLMClient, OpenAICompatibleClient
 from .github_client import GitHubClient, PullRequestPayload
-from .pipeline import AutoRemediationPipeline
+from .pipeline import AppliedPatch, AutoRemediationPipeline
 
 __all__ = [
     "ScanParser",
@@ -19,5 +19,6 @@ __all__ = [
     "OpenAICompatibleClient",
     "GitHubClient",
     "PullRequestPayload",
+    "AppliedPatch",
     "AutoRemediationPipeline",
 ]

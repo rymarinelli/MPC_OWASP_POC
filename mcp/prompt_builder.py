@@ -47,6 +47,7 @@ class PromptBuilder:
             f"Base branch: {self.context.base_branch if self.context else 'unknown'}",
             f"Severity: {vulnerability.severity}",
             f"File: {vulnerability.file_path} (lines {vulnerability.affected_range()})",
+            f"Vulnerability ID: {vulnerability.identifier}",
         ]
         if vulnerability.summary:
             header.append(f"Summary: {vulnerability.summary}")
@@ -58,7 +59,16 @@ class PromptBuilder:
         prompt = "\n".join(header)
         if context_lines:
             prompt += "\n\nCurrent implementation:\n" + context_lines
-        prompt += "\n\nPlease produce a JSON array named 'patches'. Each item must contain 'file_path' and 'replacement'."
+        prompt += (
+            "\n\nPlease produce a JSON array named 'patches'. Each item must include the keys "
+            "'file_path', 'replacement', 'vulnerability_id', and 'analysis'."
+        )
+        prompt += (
+            "\nSet 'vulnerability_id' to the identifier listed above and use 'analysis' to explain the remediation."
+        )
+        prompt += (
+            "\nIf helpful, also provide 'test_recommendations' describing commands or checks reviewers should run."
+        )
         prompt += "\nEnsure the replacement text is complete file content that resolves the vulnerability while preserving formatting."
         return prompt
 

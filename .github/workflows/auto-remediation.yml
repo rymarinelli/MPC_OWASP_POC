@@ -16,10 +16,23 @@ jobs:
     if: >-
       ${{ github.event.workflow_run.conclusion == 'success' && vars.AUTO_REMEDIATE == 'true' }}
     runs-on: ubuntu-latest
+    env:
+      DEFAULT_LLM_ENDPOINT: http://127.0.0.1:11434/v1/chat/completions
+      DEFAULT_LLM_MODEL: qwen2.5-coder:3b
+      DEFAULT_LLM_API_KEY: local-ollama
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Install local coding LLM
+        env:
+          OLLAMA_HOST: 127.0.0.1
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve >/tmp/ollama.log 2>&1 &
+          sleep 10
+          ollama pull ${{ env.DEFAULT_LLM_MODEL }}
 
       - name: Configure git user
         run: |
@@ -48,9 +61,9 @@ jobs:
 
       - name: Run MCP auto-refactor
         env:
-          MCP_LLM_ENDPOINT: ${{ secrets.MCP_LLM_ENDPOINT }}
-          MCP_LLM_MODEL: ${{ secrets.MCP_LLM_MODEL }}
-          MCP_LLM_API_KEY: ${{ secrets.MCP_LLM_API_KEY }}
+          MCP_LLM_ENDPOINT: ${{ secrets.MCP_LLM_ENDPOINT != '' && secrets.MCP_LLM_ENDPOINT || env.DEFAULT_LLM_ENDPOINT }}
+          MCP_LLM_MODEL: ${{ secrets.MCP_LLM_MODEL != '' && secrets.MCP_LLM_MODEL || env.DEFAULT_LLM_MODEL }}
+          MCP_LLM_API_KEY: ${{ secrets.MCP_LLM_API_KEY != '' && secrets.MCP_LLM_API_KEY || env.DEFAULT_LLM_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_BASE_REF: ${{ github.event.workflow_run.head_branch }}
