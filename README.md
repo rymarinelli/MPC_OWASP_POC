@@ -44,11 +44,58 @@ Use `--dry-run` to skip the commit/push/PR phase when testing locally.
 
 ## GitHub Action integration
 
-The `Automated Remediation` workflow (`.github/workflows/auto-remediation.yml`)
-triggers whenever the `Security Scan` workflow completes successfully and the
+This repository now ships with a reusable composite action (`action.yml`) that
+installs the MCP tooling and runs the auto-refactor pipeline inside any GitHub
+Actions workflow. The bundled `Automated Remediation` workflow
+(`.github/workflows/auto-remediation.yml`) consumes that action and triggers
+whenever the `Security Scan` workflow completes successfully and the
 `AUTO_REMEDIATE` repository variable is set to `true`. It downloads the scan
 artifact named `scan-results`, runs the MCP pipeline, and opens a remediation PR
 if vulnerabilities are present.
+
+### Reusable action inputs
+
+Reference the action from another workflow using the repository ref (e.g.
+`uses: owner/mcp-owasp-poc@v1`). It accepts the following inputs:
+
+| Input | Required | Description |
+| ----- | -------- | ----------- |
+| `scan_results` | ✅ | Path to the vulnerability scan JSON file relative to the workflow workspace. |
+| `llm_endpoint` | ✅ | HTTPS endpoint for the OpenAI-compatible LLM. |
+| `llm_model` | ✅ | Model identifier requested from the endpoint. |
+| `llm_api_key` | ✅ | API key or token for the LLM service. |
+| `github_token` | ❌ | Token with `contents`/`pull_request` scopes (defaults to the workflow token). |
+| `github_repository` | ❌ | Repository in `owner/name` format (defaults to the current repository). |
+| `repo_root` | ❌ | Path to the repository that should be remediated (defaults to the workflow workspace). |
+| `base_branch` | ❌ | Branch used as the PR base. |
+| `branch_prefix` | ❌ | Prefix applied to generated remediation branches. |
+| `remote` | ❌ | Git remote to push remediation branches to (defaults to `origin`). |
+| `formatter` | ❌ | Newline separated formatter command templates (e.g. `black {path}`). |
+| `validations` | ❌ | Newline separated validation commands (e.g. `pytest`). |
+| `max_vulnerabilities` | ❌ | Upper bound on the number of findings to remediate. |
+| `dry_run` | ❌ | Set to `true` to skip committing, pushing, and PR creation. |
+| `python_version` | ❌ | Python runtime to install (defaults to `3.11`). |
+
+Example usage within a workflow:
+
+```yaml
+- name: Run MCP auto-remediation
+  uses: owner/mcp-owasp-poc@v1
+  with:
+    scan_results: artifacts/scan-results.json
+    llm_endpoint: ${{ secrets.MCP_LLM_ENDPOINT }}
+    llm_model: ${{ secrets.MCP_LLM_MODEL }}
+    llm_api_key: ${{ secrets.MCP_LLM_API_KEY }}
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    formatter: |
+      black {path}
+    validations: |
+      pytest
+```
+
+Ensure the workflow checks out the target repository and installs any
+project-specific dependencies before invoking the action so validation commands
+have the required tooling available.
 
 ### Required configuration
 
@@ -82,20 +129,18 @@ Optional repository variables can provide additional guardrails:
 The MCP tooling is designed to be portable across projects. To enable automated
 remediation in another repository:
 
-1. Copy the `mcp/` package and `scripts/auto_refactor.py` into the target
-   repository (or install them as a package if published internally).
+1. Reference the composite action from a workflow (for example,
+   `uses: owner/mcp-owasp-poc@v1`) or install the package and run the
+   `mcp-auto-refactor` console script directly.
 2. Add the required secrets/variables (`MCP_LLM_ENDPOINT`, `MCP_LLM_MODEL`,
    `MCP_LLM_API_KEY`, `AUTO_REMEDIATE`) and optionally `MCP_FORMATTER`/
    `MCP_MAX_VULNS` in the destination repository settings.
-3. Drop the workflow from `.github/workflows/auto-remediation.yml` into the
-   target repository and adjust the validation commands to reflect the
-   project's test suite or formatters.
-4. Ensure the vulnerability scanning workflow exports its findings as a
+3. Ensure the vulnerability scanning workflow exports its findings as a
    `scan-results.json` artifact that follows the structure expected by
    `ScanParser`. See `ScanParser` docstrings for the minimal schema and extend
    the parser if your scanner requires custom handling.
-5. Run the script locally using `--dry-run` on a sample scan file to confirm it
-   understands the repository layout before enabling the GitHub Action.
+4. Run the script or action locally using `--dry-run` on a sample scan file to
+   confirm it understands the repository layout before enabling automated PRs.
 
 ### Integrating Semgrep OWASP Top 10 checks
 
@@ -116,6 +161,24 @@ Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
+```
+
+### Installing as a package
+
+The project includes a `pyproject.toml`, allowing it to be installed as a
+standard Python package. This makes it easier to distribute the MCP tooling to
+other repositories without copying the source tree.
+
+```bash
+pip install .
+```
+
+Once installed, the `mcp-auto-refactor` console script becomes available. It is
+functionally equivalent to running `python scripts/auto_refactor.py` and can be
+invoked from any repository:
+
+```bash
+mcp-auto-refactor --scan-results path/to/scan-results.json --dry-run
 ```
 
 Run the auto-refactor script locally with `--dry-run` to inspect generated

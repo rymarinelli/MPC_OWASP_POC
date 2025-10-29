@@ -1,0 +1,128 @@
+name: "MCP Auto Remediator"
+description: "Run the MCP auto-refactor pipeline against vulnerability scan results"
+author: "MCP Maintainers"
+inputs:
+  scan_results:
+    description: "Path to the vulnerability scan JSON file"
+    required: true
+  llm_endpoint:
+    description: "HTTPS endpoint for the OpenAI-compatible LLM"
+    required: true
+  llm_model:
+    description: "Model identifier to request from the LLM endpoint"
+    required: true
+  llm_api_key:
+    description: "API key or token for the LLM service"
+    required: true
+  github_token:
+    description: "Token used for pushing branches and opening pull requests"
+    required: false
+  github_repository:
+    description: "GitHub repository in owner/name format (defaults to the current repository)"
+    required: false
+  repo_root:
+    description: "Path to the repository root that should be remediated"
+    required: false
+  base_branch:
+    description: "Base branch to target when opening the pull request"
+    required: false
+  branch_prefix:
+    description: "Prefix used for the remediation branch"
+    required: false
+  remote:
+    description: "Git remote name to push remediation branches to"
+    required: false
+  formatter:
+    description: "Newline separated formatter command templates that will be run on patched files"
+    required: false
+  validations:
+    description: "Newline separated validation commands to run after patches are applied"
+    required: false
+  max_vulnerabilities:
+    description: "Maximum number of vulnerabilities to remediate in a single run"
+    required: false
+  dry_run:
+    description: "If set to true, skip committing, pushing, and opening a PR"
+    default: "false"
+    required: false
+  python_version:
+    description: "Python version used to execute the pipeline"
+    default: "3.11"
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install MCP auto-refactor tooling
+      shell: bash
+      run: |
+        set -eo pipefail
+        python -m pip install --upgrade pip
+        pip install "${{ github.action_path }}"
+
+    - name: Run MCP auto-refactor
+      shell: bash
+      env:
+        MCP_LLM_ENDPOINT: ${{ inputs.llm_endpoint }}
+        MCP_LLM_MODEL: ${{ inputs.llm_model }}
+        MCP_LLM_API_KEY: ${{ inputs.llm_api_key }}
+        GITHUB_TOKEN: ${{ inputs.github_token || github.token }}
+        GITHUB_REPOSITORY: ${{ inputs.github_repository || github.repository }}
+      run: |
+        set -eo pipefail
+        CMD=(mcp-auto-refactor --scan-results "${{ inputs.scan_results }}")
+
+        if [ -n "${{ inputs.repo_root }}" ]; then
+          CMD+=("--repo-root" "${{ inputs.repo_root }}")
+        fi
+
+        if [ -n "${{ inputs.base_branch }}" ]; then
+          CMD+=("--base-branch" "${{ inputs.base_branch }}")
+        fi
+
+        if [ -n "${{ inputs.branch_prefix }}" ]; then
+          CMD+=("--branch-prefix" "${{ inputs.branch_prefix }}")
+        fi
+
+        if [ -n "${{ inputs.remote }}" ]; then
+          CMD+=("--remote" "${{ inputs.remote }}")
+        fi
+
+        if [ -n "${{ inputs.max_vulnerabilities }}" ]; then
+          CMD+=("--max-vulnerabilities" "${{ inputs.max_vulnerabilities }}")
+        fi
+
+        dry_run_input="${{ inputs.dry_run }}"
+        if [ -n "$dry_run_input" ]; then
+          dry_run_value=$(printf '%s' "$dry_run_input" | tr '[:upper:]' '[:lower:]')
+          if [ "$dry_run_value" = "true" ]; then
+            CMD+=("--dry-run")
+          fi
+        fi
+
+        if [ -n "${{ inputs.formatter }}" ]; then
+          while IFS= read -r formatter; do
+            formatter=$(printf '%s' "$formatter" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -n "$formatter" ]; then
+              CMD+=("--formatter" "$formatter")
+            fi
+          done <<< "${{ inputs.formatter }}"
+        fi
+
+        if [ -n "${{ inputs.validations }}" ]; then
+          while IFS= read -r validation; do
+            validation=$(printf '%s' "$validation" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -n "$validation" ]; then
+              CMD+=("--validate" "$validation")
+            fi
+          done <<< "${{ inputs.validations }}"
+        fi
+
+        "${CMD[@]}"
+branding:
+  icon: "cpu"
+  color: "blue"
