@@ -6,7 +6,7 @@ of a small code-focused language model.
 
 ## MCP auto-remediation pipeline
 
-The `mcp/` package contains the building blocks required to parse scan results,
+The `mpc_owasp/` package contains the building blocks required to parse scan results,
 craft prompts, invoke a language model, and write well-formatted patch
 candidates back to the repository. Key components include:
 
@@ -87,7 +87,7 @@ Optional repository variables can provide additional guardrails:
 The MCP tooling is designed to be portable across projects. To enable automated
 remediation in another repository:
 
-1. Copy the `mcp/` package and `scripts/auto_refactor.py` into the target
+1. Copy the `mpc_owasp/` package and `scripts/auto_refactor.py` into the target
    repository (or install them as a package if published internally).
 2. Add the required secrets/variables (`MCP_LLM_ENDPOINT`, `MCP_LLM_MODEL`,
    `MCP_LLM_API_KEY`, `AUTO_REMEDIATE`) and optionally `MCP_FORMATTER`/
@@ -125,3 +125,18 @@ pip install -r requirements.txt
 
 Run the auto-refactor script locally with `--dry-run` to inspect generated
 changes without touching remotes.
+
+## Google Colab deployment with ngrok
+
+When experimenting in Google Colab you can expose the local MCP server to the
+internet with ngrok. Provide an ngrok auth token (either via the
+`NGROK_AUTHTOKEN` environment variable or `--authtoken`) and run:
+
+```bash
+python scripts/deploy_colab_ngrok.py
+```
+
+The script installs the required Python packages, starts `mcp_server.py`, opens
+an HTTPS tunnel, and prints the public endpoint you can share with other tools.
+Use `--skip-install` if dependencies are already satisfied or `--skip-server` if
+you plan to launch `mcp_server.py` yourself.

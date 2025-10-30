@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Mapping, Sequence
 
-from mcp import (
+from mpc_owasp import (
     AppliedPatch,
     AutoRemediationPipeline,
     GitHubClient,
