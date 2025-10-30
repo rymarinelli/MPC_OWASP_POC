@@ -1,9 +1,14 @@
 import subprocess
 import tempfile
 from pathlib import Path
+import sys
 import unittest
 
-from mcp import AppliedPatch, PatchCandidate, Vulnerability
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from mpc_owasp import AppliedPatch, PatchCandidate, Vulnerability
 from scripts.auto_refactor import build_pr_body, stage_and_commit
 
 
