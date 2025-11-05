@@ -1,5 +1,170 @@
 rules:
   - id: owasp-top10-a03-command-injection
+    languages: [typescript]
+    message: "Avoid executing commands with untrusted input; use child_process.execFile or spawn without shell."
+    severity: ERROR
+    metadata:
+      category: OWASP A03: Injection
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern-either:
+          - pattern: child_process.exec(..., { shell: true, ... })
+          - pattern: child_process.execSync(..., { shell: true, ... })
+          - pattern: child_process.spawn(..., { shell: true, ... })
+          - pattern: eval(...)
+          - pattern: Function(...)
+    fix: "Use execFile or spawn with explicit args and shell=false."
+
+  - id: owasp-top10-a03-sql-injection
+    languages: [typescript]
+    message: "Detected SQL query built via string concatenation; use parameterized queries or query builders."
+    severity: ERROR
+    metadata:
+      category: OWASP A03: Injection
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern-either:
+          - pattern: $DB.query("..." + ...)
+          - pattern: $DB.query(`...${...}...`)
+          - pattern: $DB.execute("..." + ...)
+          - pattern: $DB.execute(`...${...}...`)
+    fix: "Use parameterized queries, e.g., db.query('SELECT ... WHERE id = ?', [param])."
+
+  - id: owasp-top10-a02-hardcoded-secret
+    languages: [typescript]
+    message: "Hard-coded secret detected; move credentials to environment variables or secret managers."
+    severity: WARNING
+    metadata:
+      category: OWASP A02: Cryptographic Failures
+      owasp: "A02:2021 - Cryptographic Failures"
+    pattern: const $VAR = "..."
+    metavariable-pattern:
+      metavariable: $VAR
+      pattern: /(?i)(password|passwd|secret|token|apikey|api_key|auth|credential).*/
+
+  - id: owasp-top10-a02-insecure-transport
+    languages: [typescript]
+    message: "TLS verification disabled in axios/fetch; always validate certificates."
+    severity: ERROR
+    metadata:
+      category: OWASP A02: Cryptographic Failures
+      owasp: "A02:2021 - Cryptographic Failures"
+    patterns:
+      - pattern-either:
+          - pattern: axios.get(..., { httpsAgent: new https.Agent({ rejectUnauthorized: false }) })
+          - pattern: fetch(..., { agent: new https.Agent({ rejectUnauthorized: false }) })
+    fix: "Remove rejectUnauthorized:false or configure trusted CA certificates."
+
+  - id: owasp-top10-a05-debug-enabled
+    languages: [typescript]
+    message: "Debug mode is enabled; disable in production."
+    severity: WARNING
+    metadata:
+      category: OWASP A05: Security Misconfiguration
+      owasp: "A05:2021 - Security Misconfiguration"
+    patterns:
+      - pattern-either:
+          - pattern: app.set('debug', true)
+          - pattern: app.listen(..., () => console.log('Debug mode...'))
+          - pattern: process.env.NODE_ENV == "development"
+
+  - id: owasp-top10-a08-insecure-yaml-deserialization
+    languages: [typescript]
+    message: "Insecure YAML deserialization detected; use safeLoad or secure parser."
+    severity: ERROR
+    metadata:
+      category: OWASP A08: Software and Data Integrity Failures
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., { schema: yaml.FAILSAFE_SCHEMA, ... })
+      - pattern-not: yaml.safeLoad(...)
+    fix: "Use yaml.safeLoad() or yaml.load(..., { schema: yaml.FAILSAFE_SCHEMA })."
+
+  - id: owasp-top10-a08-pickle-deserialization
+    languages: [typescript]
+    message: "Avoid using eval or unserialize for untrusted data; prefer JSON.parse with validation."
+    severity: ERROR
+    metadata:
+      category: OWASP A08: Software and Data Integrity Failures
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: Function("return " + ...)
+      - pattern: vm.runInContext(...)
+
+  - id: owasp-top10-a02-weak-hash
+    languages: [typescript]
+    message: "Weak hash algorithm detected; use SHA-256 or stronger."
+    severity: WARNING
+    metadata:
+      category: OWASP A02: Cryptographic Failures
+      owasp: "A02:2021 - Cryptographic Failures"
+    pattern-either:
+      - pattern: crypto.createHash("md5")
+      - pattern: crypto.createHash("sha1")
+
+  - id: owasp-top10-a05-insecure-tempfile
+    languages: [typescript]
+    message: "Insecure temp file creation; use fs.mkdtemp or secure temporary directories."
+    severity: ERROR
+    metadata:
+      category: OWASP A05: Security Misconfiguration
+      owasp: "A05:2021 - Security Misconfiguration"
+    patterns:
+      - pattern-either:
+          - pattern: fs.writeFileSync('/tmp/' + ...)
+          - pattern: fs.createWriteStream('/tmp/' + ...)
+
+  - id: owasp-top10-a07-jwt-without-verify
+    languages: [typescript]
+    message: "JWT decode without verification; ensure signature validation."
+    severity: ERROR
+    metadata:
+      category: OWASP A07: Identification and Authentication Failures
+      owasp: "A07:2021 - Identification and Authentication Failures"
+    pattern: jwt.decode(...)
+    pattern-not: jwt.verify(...)
+
+  - id: owasp-top10-a09-broad-except
+    languages: [typescript]
+    message: "Catching all exceptions hides specific errors; catch targeted error types."
+    severity: WARNING
+    metadata:
+      category: OWASP A09: Security Logging and Monitoring Failures
+      owasp: "A09:2021 - Security Logging and Monitoring Failures"
+    pattern: |
+      try {
+        ...
+      } catch (e) {
+        ...
+      }
+
+  - id: owasp-top10-a01-overly-broad-cors
+    languages: [typescript]
+    message: "CORS policy allows all origins; restrict to trusted domains."
+    severity: WARNING
+    metadata:
+      category: OWASP A01: Broken Access Control
+      owasp: "A01:2021 - Broken Access Control"
+    patterns:
+      - pattern-either:
+          - pattern: app.use(cors({ origin: "*" }))
+          - pattern: res.setHeader("Access-Control-Allow-Origin", "*")
+
+  - id: owasp-top10-a10-ssrf-user-input
+    languages: [typescript]
+    message: "User input used in outbound requests; validate or whitelist destinations to prevent SSRF."
+    severity: ERROR
+    metadata:
+      category: OWASP A10: Server-Side Request Forgery
+      owasp: "A10:2021 - Server-Side Request Forgery"
+    patterns:
+      - pattern: axios.$FUNC($URL, ...)
+      - metavariable-pattern:
+          metavariable: $URL
+          pattern: /(req\.body|req\.query|req\.params|req\.headers|req\.url)/
+  - id: owasp-top10-a03-command-injection
     languages: [python]
     message: "Avoid invoking shells with untrusted input; prefer subprocess without shell=True or use shlex.quote."
     severity: ERROR
