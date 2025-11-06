@@ -7,7 +7,7 @@ from transformers import pipeline
 from fastmcp import FastMCP
 import os, json, tempfile, shutil, subprocess, traceback, requests
 from pathlib import Path
-
+from datetime import datetime
 # ============================================================
 # CONFIG
 # ============================================================
@@ -138,7 +138,8 @@ def scan_github_repo(
         remediation_text = hf_remediation_from_findings(findings) if llm_proposal else ""
 
         ensure_git_identity(repo_dir)
-        branch_name = "mcp/remediation"
+        ts = datetime.utcnow().strftime("%a-%d-%b-%Y-%H%MUTC")  # e.g. Thu-06-Nov-2025-1423UTC
+        branch_name = f"mcp/remediation-{ts}
         subprocess.run(["git", "checkout", "-b", branch_name], cwd=repo_dir, check=True)
 
         def apply_llm_fix_to_file(finding: dict):
