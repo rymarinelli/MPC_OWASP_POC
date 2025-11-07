@@ -139,7 +139,7 @@ def scan_github_repo(
 
         ensure_git_identity(repo_dir)
         ts = datetime.utcnow().strftime("%a-%d-%b-%Y-%H%MUTC")  # e.g. Thu-06-Nov-2025-1423UTC
-        branch_name = f"mcp/remediation-{ts}
+        branch_name = f"mcp/remediation-{ts}"
         subprocess.run(["git", "checkout", "-b", branch_name], cwd=repo_dir, check=True)
 
         def apply_llm_fix_to_file(finding: dict):
@@ -232,13 +232,181 @@ def scan_github_repo(
                 subprocess.run(["git", "commit", "-m", msg], cwd=repo_dir)
 
         report_path = os.path.join(repo_dir, "MCP_SECURITY_REPORT.md")
-        ts = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(f"# MCP Security Report\n\nTarget: {repo_url}\nTime: {ts}\nFindings: {len(findings)}\nPatched: {applied}\n\n{remediation_text}\n")
 
         subprocess.run(["git", "add", report_path], cwd=repo_dir)
         subprocess.run(["git", "commit", "-m", "Add MCP security report"], cwd=repo_dir)
         subprocess.run(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_dir)
+        # ============================================================
+        # 🧱 SANDBOX INSPECTION STEP (TIMESTAMPED REPORT + COMMIT)
+        # ============================================================
+        try:
+            print("[MCP] 🔄 Cloning sandbox inspection repo...")
+            sandbox_repo_url = "https://github.com/rymarinelli/sandbox.git"
+            sandbox_dir = os.path.join(tmp_dir, "sandbox")
+            if os.path.exists(sandbox_dir):
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
+
+
+            try:
+                subprocess.run(["git", "clone", sandbox_repo_url, sandbox_dir], check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                token = os.getenv("GITHUB_TOKEN")
+                if token:
+                    authed_url = sandbox_repo_url.replace(
+                        "https://", f"https://{token}@"
+                    )
+                    print("[MCP] 🔑 Retrying clone with token authentication...")
+                    subprocess.run(["git", "clone", authed_url, sandbox_dir], check=True)
+                else:
+                    print("[MCP] ❌ Sandbox clone failed and no GITHUB_TOKEN available.")
+                    print(e.stderr)
+                    raise
+            if clone_proc.returncode != 0:
+                print(f"[MCP] ⚠️ Sandbox clone failed: {clone_proc.stderr.strip()}")
+                return {
+                    "error": "could not clone sandbox repo",
+                    "stderr": clone_proc.stderr,
+                    "returncode": clone_proc.returncode,
+                }
+            print("[MCP] ✅ Sandbox repo cloned successfully.")
+
+         
+            print("[MCP] 🧩 Installing sandbox dependencies...")
+            subprocess.run(
+                ["pip", "install", "-r", "requirements-dev.txt"],
+                cwd=sandbox_dir, check=True, capture_output=True, text=True
+            )
+
+            print("[MCP] 🧠 Running inspect_vibe_code.py against remediated workspace...")
+
+            sandbox_json = os.path.join(repo_dir, "sandbox_report.json")
+
+            # Derive timestamp + use same suffix as remediation branch
+            ts_suffix = branch_name.split("mcp/remediation-")[-1]  # e.g. Thu-06-Nov-2025-1423UTC
+            sandbox_md = os.path.join(repo_dir, f"SANDBOX_SCAN_REPORT_{ts_suffix}.md")
+
+            sandbox_proc = subprocess.run(
+                [
+                    "python",
+                    "scripts/inspect_vibe_code.py",
+                    "--workspace",
+                    repo_dir,
+                    "--prompt",
+                    os.path.join(repo_dir, "prompts/user.txt")
+                    if os.path.exists(os.path.join(repo_dir, "prompts/user.txt"))
+                    else "prompts/user.txt",
+                    "--fail-on-high",
+                    "--json",
+                ],
+                cwd=sandbox_dir,
+                capture_output=True,
+                text=True,
+            )
+
+            with open(sandbox_json, "w", encoding="utf-8") as f:
+                f.write(sandbox_proc.stdout)
+
+            sandbox_status = "passed" if sandbox_proc.returncode == 0 else (
+                "failed-high" if sandbox_proc.returncode == 2 else "error"
+            )
+
+            # ✅ Write Markdown summary (persistent trace)
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            with open(sandbox_md, "w", encoding="utf-8") as f:
+                f.write(f"# Sandbox Inspection Report ({ts_suffix})\n\n")
+                f.write(f"**Time:** {ts}\n\n")
+                f.write(f"**Sandbox Status:** {sandbox_status}\n\n")
+                f.write("## Raw Output\n\n```\n")
+                if sandbox_proc.stdout.strip():
+                    f.write("### STDOUT\n")
+                    f.write(sandbox_proc.stdout[:8000])
+                    f.write("\n\n")
+                if sandbox_proc.stderr.strip():
+                    f.write("### STDERR\n")
+                    f.write(sandbox_proc.stderr[:8000])
+                    f.write("\n")
+                if not sandbox_proc.stdout.strip() and not sandbox_proc.stderr.strip():
+                    f.write("(no output captured — process may have exited early or failed silently)\n")
+                f.write("```\n")
+
+            # ✅ Always commit & push the report
+            ensure_git_identity(repo_dir)
+            subprocess.run(["git", "add", sandbox_md], cwd=repo_dir)
+            subprocess.run(
+                ["git", "commit", "-m", f"Add sandbox scan report ({sandbox_status})"],
+                cwd=repo_dir,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "push", "-u", "origin", branch_name, "--force"],
+                cwd=repo_dir,
+                check=False,
+            )
+
+            if sandbox_proc.returncode == 2:
+                print("[MCP] ❌ High severity findings detected — aborting PR creation.")
+                return {
+                    "repo_dir": repo_dir,
+                    "sandbox_status": sandbox_status,
+                    "sandbox_report": sandbox_md,
+                    "stderr": sandbox_proc.stderr,
+                }
+
+
+            print(f"[MCP] Sandbox inspection complete ({sandbox_status}). Report committed.")
+           # ============================================================
+            # 🔍 Detailed sandbox run logging
+            # ============================================================
+            start_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            print(f"[MCP] 🧪 Sandbox run started at: {start_ts}")
+            print(f"[MCP] 🧱 Sandbox command: {' '.join(sandbox_proc.args)}")
+            print(f"[MCP] 🕒 Return code: {sandbox_proc.returncode}")
+
+            stdout_preview = sandbox_proc.stdout[:1000].strip()
+            stderr_preview = sandbox_proc.stderr[:1000].strip()
+
+            print(f"[MCP] 📤 STDOUT (first 1k chars):\n{stdout_preview}\n---")
+            if stderr_preview:
+                print(f"[MCP] ⚠️ STDERR (first 1k chars):\n{stderr_preview}\n---")
+
+            duration = getattr(sandbox_proc, "duration", None)
+            if duration:
+                print(f"[MCP] ⏱️ Duration: {duration:.2f}s")
+
+        except Exception as e:
+          print(f"[MCP] ⚠️ Sandbox inspection failed: {e}")
+          fail_suffix = branch_name.split("mcp/remediation-")[-1]
+          fail_md = os.path.join(repo_dir, f"SANDBOX_SCAN_REPORT_{fail_suffix}.md")
+
+          raw_trace = traceback.format_exc()
+          token = os.getenv("GITHUB_TOKEN")
+          if token and token in raw_trace:
+              masked_trace = raw_trace.replace(token, "***MASKED_GITHUB_TOKEN***")
+          else:
+              masked_trace = raw_trace
+
+          # Also scrub any accidental 'https://<token>@' pattern (defense-in-depth)
+          import re
+          masked_trace = re.sub(r"https://[A-Za-z0-9_\-]+@github\.com", "https://***@github.com", masked_trace)
+
+          with open(fail_md, "w", encoding="utf-8") as f:
+              f.write(f"# Sandbox Inspection Error ({fail_suffix})\n\n")
+              f.write(masked_trace + "\n")
+
+          ensure_git_identity(repo_dir)
+          subprocess.run(["git", "add", fail_md], cwd=repo_dir)
+          subprocess.run(["git", "commit", "-m", "Add sandbox scan failure report"], cwd=repo_dir)
+          subprocess.run(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_dir)
+
+          return {
+              "repo_dir": repo_dir,
+              "error": "sandbox step failed",
+              "trace": masked_trace,
+          }
+
+
 
         return {"repo_dir": repo_dir, "num_findings": len(findings), "llm_applied_fixes": applied, "report_path": report_path}
 
