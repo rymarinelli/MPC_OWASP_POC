@@ -191,25 +191,6 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
     }
 
 
-
-
-@register_tool()
-def open_pr(branch: str = "mcp/remediation",
-            title: str = "Automated remediation",
-            body: str = "Proposed fixes from MCP remediator") -> Dict[str, Any]:
-    """Create a PR from the current branch."""
-    def run(*args): subprocess.run(list(args), check=True)
-    run("git", "checkout", "-B", branch)
-    run("git", "add", "-A")
-    try:
-        run("git", "commit", "-m", title)
-    except Exception:
-        pass
-    run("git", "push", "-u", "origin", branch, "--force")
-    return {"branch": branch, "title": title, "body": body}
-
-
-
 @register_tool("scan_github_repo")
 def scan_github_repo(
     repo_url: str,
@@ -234,8 +215,12 @@ def scan_github_repo(
         clone_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{repo}.git" if GITHUB_TOKEN else f"https://github.com/{owner}/{repo}.git"
 
         for branch_try in (base_branch, "master"):
-            clone_proc = subprocess.run(["git", "clone", "--depth", "1", "--branch", branch_try, clone_url, repo_dir], capture_output=True, text=True)
+            clone_proc = subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", branch_try, clone_url, repo_dir],
+                capture_output=True, text=True
+            )
             if clone_proc.returncode == 0:
+                base_branch = branch_try
                 break
         if clone_proc.returncode != 0:
             return {"error": "could not clone repo", "stderr": mask_sensitive(clone_proc.stderr)}
@@ -324,7 +309,6 @@ def scan_github_repo(
             try:
                 sbx = run_sandbox_inspect(repo_dir, tmp_dir, ts_suffix)
             except Exception:
-                # If sandbox infra fails, capture masked traceback and still commit an "error" report
                 masked_trace = mask_sensitive(traceback.format_exc())
                 fail_md = os.path.join(repo_dir, f"SANDBOX_SCAN_REPORT_{ts_suffix}.md")
                 with open(fail_md, "w", encoding="utf-8") as f:
@@ -346,6 +330,15 @@ def scan_github_repo(
             subprocess.run(["git", "add", rel_path], cwd=repo_dir)
             subprocess.run(["git", "commit", "-m", msg], cwd=repo_dir)
             applied += 1
+
+        # bail out if *no* changes were made by LLM (before adding any reports)
+        status = subprocess.run(["git", "status", "--short"], cwd=repo_dir, capture_output=True, text=True)
+        if not status.stdout.strip():
+            return {
+                "warning": "no changes to commit (LLM didn't modify anything)",
+                "repo_dir": repo_dir,
+                "num_findings": len(findings),
+            }
 
         # --- overall report file (after fixes) ---
         report_path = os.path.join(repo_dir, "MCP_SECURITY_REPORT.md")
@@ -374,7 +367,7 @@ def scan_github_repo(
             check=False,
         )
 
-        # push (PR creation happens elsewhere; sandbox already ran)
+        # push (PR happens next)
         subprocess.run(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_dir, check=False)
 
         # If policy: block PR on high severity, return info (caller can decide)
@@ -388,6 +381,68 @@ def scan_github_repo(
                 "note": "High severity findings — PR creation should be blocked upstream."
             }
 
+        # Create PR with Markdown body and labels (fully qualified head)
+        pr_info = None
+        if GITHUB_TOKEN and create_pr:
+            # Build a concise PR markdown body
+            md_lines = [
+                "# MCP: Automated Security Remediation",
+                "",
+                f"- **Target repo:** `{owner}/{repo}`",
+                f"- **Base branch:** `{base_branch}`",
+                f"- **Head branch:** `{branch_name}`",
+                f"- **Findings (Semgrep):** {len(findings)}",
+                f"- **Patched files:** {applied}",
+                f"- **Final sandbox status:** {final_sbx.get('status','unknown')}",
+                "",
+                "## Reports",
+                f"- `{os.path.basename(report_path)}`",
+                f"- `{os.path.basename(final_sbx.get('md_path',''))}`",
+            ]
+            pr_body = "\n".join(md_lines)
+
+            headers = {
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            }
+            pr_payload = {
+                "title": "MCP: automated security remediation",
+                "head": f"{owner}:{branch_name}",  # fully qualified to avoid unrelated-history 422
+                "base": base_branch,
+                "body": pr_body,
+            }
+            pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            pr_resp = requests.post(pr_url, headers=headers, json=pr_payload)
+
+            if pr_resp.status_code in (200, 201):
+                pr_json = pr_resp.json()
+                pr_number = pr_json.get("number")
+                pr_html_url = pr_json.get("html_url")
+
+                # optional labels
+                if pr_labels:
+                    labels_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/labels"
+                    try:
+                        requests.post(labels_url, headers=headers, json={"labels": pr_labels})
+                    except Exception:
+                        pass
+
+                pr_info = {
+                    "branch": branch_name,
+                    "pushed": True,
+                    "pull_request": pr_html_url,
+                    "number": pr_number,
+                }
+            else:
+                pr_info = {
+                    "branch": branch_name,
+                    "pushed": True,
+                    "pr_error_status": pr_resp.status_code,
+                    "pr_error_body": mask_sensitive(pr_resp.text),
+                    "pr_payload": pr_payload,
+                    "pr_url": pr_url,
+                }
+
         return {
             "repo_dir": repo_dir,
             "num_findings": len(findings),
@@ -395,6 +450,7 @@ def scan_github_repo(
             "report_path": report_path,
             "final_sandbox_status": final_sbx["status"],
             "final_report": final_sbx["md_path"],
+            "pr_info": pr_info,
         }
 
     finally:
