@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Optional, Dict, Any, List, Callable
 import sys, inspect, os, json, subprocess, socket, tempfile, shutil, requests, traceback
 from fastapi import FastAPI, HTTPException, Header
@@ -147,7 +148,7 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
             "python", "scripts/inspect_vibe_code.py",
             "--workspace", repo_dir,
             "--prompt",
-            os.path.join(repo_dir, "prompts/user.txt") if os.path.exists(os.path.join(repo_dir, "prompts/user.txt")) else "prompts/user.txt",
+            "Review finding", ##os.path.join(repo_dir, "prompts/user.txt") if os.path.exists(os.path.join(repo_dir, "prompts/user.txt")) else "prompts/user.txt",
             "--fail-on-high",
             "--json",
         ],
@@ -259,7 +260,16 @@ def scan_github_repo(
             line_no = (finding.get("start", {}) or finding.get("extra", {}).get("lines", {})).get("line")
             if not line_no:
                 return None
-
+                      # Write LLM fix to prompts/user.txt before sandbox run
+            # try:
+            #     prompts_dir = os.path.join(repo_dir, "prompts")
+            #     os.makedirs(prompts_dir, exist_ok=True)
+            #     with open(os.path.join(prompts_dir, "user.txt"), "w", encoding="utf-8") as f:
+            #         f.write("")
+            # except Exception as e:
+            #     print(f"[MCP] ⚠️ Could not write prompt for sandbox: {e}")
+                
+     
             # produce fixed line
             try:
                 with open(target_file, "r", encoding="utf-8") as f:
@@ -283,13 +293,13 @@ def scan_github_repo(
 
             block = [
                 f"# === MCP FIX START ({finding.get('check_id','semgrep_rule')}) ===\n",
-                f"# {finding.get('extra',{}).get('message','')}\n",
                 f"# Severity: {finding.get('extra',{}).get('severity','')}\n",
                 vuln_line + "\n",
                 "# → Suggested secure fix:\n",
                 fixed_line + "\n",
                 "# === MCP FIX END ===\n",
             ]
+  
             try:
                 lines[line_no - 1:line_no] = block
                 with open(target_file, "w", encoding="utf-8") as f:
@@ -308,6 +318,17 @@ def scan_github_repo(
             ts_suffix = f"{branch_name.split('mcp/remediation-')[-1]}-{applied+1:03d}"
             try:
                 sbx = run_sandbox_inspect(repo_dir, tmp_dir, ts_suffix)
+                 # If policy: block PR on high severity, return info (caller can decide)
+                if sbx["status"] == "failed-high":
+                    return {
+                        "repo_dir": repo_dir,
+                        "num_findings": len(findings),
+                        "llm_applied_fixes": applied,
+                        "final_sandbox_status": sbx["status"],
+                        "final_report": sbx["md_path"],
+                        "note": "High severity findings — PR creation should be blocked upstream."
+                    }
+
             except Exception:
                 masked_trace = mask_sensitive(traceback.format_exc())
                 fail_md = os.path.join(repo_dir, f"SANDBOX_SCAN_REPORT_{ts_suffix}.md")
@@ -330,6 +351,7 @@ def scan_github_repo(
             subprocess.run(["git", "add", rel_path], cwd=repo_dir)
             subprocess.run(["git", "commit", "-m", msg], cwd=repo_dir)
             applied += 1
+            
 
         # bail out if *no* changes were made by LLM (before adding any reports)
         status = subprocess.run(["git", "status", "--short"], cwd=repo_dir, capture_output=True, text=True)
@@ -350,37 +372,10 @@ def scan_github_repo(
         subprocess.run(["git", "add", report_path], cwd=repo_dir)
         subprocess.run(["git", "commit", "-m", "Add MCP security report"], cwd=repo_dir)
 
-        # 🔒 FINAL SANDBOX BEFORE PR CREATION
-        final_suffix = f"{branch_name.split('mcp/remediation-')[-1]}-final"
-        try:
-            final_sbx = run_sandbox_inspect(repo_dir, tmp_dir, final_suffix)
-        except Exception:
-            masked_trace = mask_sensitive(traceback.format_exc())
-            err_md = os.path.join(repo_dir, f"SANDBOX_SCAN_REPORT_{final_suffix}.md")
-            with open(err_md, "w", encoding="utf-8") as f:
-                f.write(f"# Sandbox Inspection Error ({final_suffix})\n\n```\n{masked_trace}\n```\n")
-            final_sbx = {"status": "error", "returncode": 99, "md_path": err_md}
-        subprocess.run(["git", "add", final_sbx["md_path"]], cwd=repo_dir)
-        subprocess.run(
-            ["git", "commit", "-m", f"Final sandbox inspect ({final_sbx['status']}) rc={final_sbx.get('returncode',-1)}"],
-            cwd=repo_dir,
-            check=False,
-        )
-
         # push (PR happens next)
         subprocess.run(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_dir, check=False)
 
-        # If policy: block PR on high severity, return info (caller can decide)
-        if final_sbx["status"] == "failed-high":
-            return {
-                "repo_dir": repo_dir,
-                "num_findings": len(findings),
-                "llm_applied_fixes": applied,
-                "final_sandbox_status": final_sbx["status"],
-                "final_report": final_sbx["md_path"],
-                "note": "High severity findings — PR creation should be blocked upstream."
-            }
-
+       
         # Create PR with Markdown body and labels (fully qualified head)
         pr_info = None
         if GITHUB_TOKEN and create_pr:
@@ -393,11 +388,9 @@ def scan_github_repo(
                 f"- **Head branch:** `{branch_name}`",
                 f"- **Findings (Semgrep):** {len(findings)}",
                 f"- **Patched files:** {applied}",
-                f"- **Final sandbox status:** {final_sbx.get('status','unknown')}",
                 "",
                 "## Reports",
                 f"- `{os.path.basename(report_path)}`",
-                f"- `{os.path.basename(final_sbx.get('md_path',''))}`",
             ]
             pr_body = "\n".join(md_lines)
 
@@ -448,8 +441,6 @@ def scan_github_repo(
             "num_findings": len(findings),
             "llm_applied_fixes": applied,
             "report_path": report_path,
-            "final_sandbox_status": final_sbx["status"],
-            "final_report": final_sbx["md_path"],
             "pr_info": pr_info,
         }
 
