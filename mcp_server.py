@@ -182,6 +182,12 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
             mf.write("(no output captured)\n")
         mf.write("```\n")
 
+
+    url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-sandbox"
+    try:
+        response = requests.post(url)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Request failed: {e}")
     return {
         "status": status,
         "returncode": proc.returncode,
