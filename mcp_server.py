@@ -124,6 +124,7 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
         shutil.rmtree(sandbox_dir, ignore_errors=True)
 
     # Clone sandbox (retry with token if necessary)
+    SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN")
     try:
         subprocess.run(["git", "clone", sandbox_repo_url, sandbox_dir], check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError:
@@ -162,6 +163,18 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
     masked_stdout = mask_sensitive(proc.stdout)
     masked_stderr = mask_sensitive(proc.stderr)
 
+    if status is  "passed":
+        try:
+            url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-sandbox"
+            headers = {
+                "Authorization": f"Bearer {SUPABASE_TOKEN}",
+                "Content-Type": "application/json"
+            }
+        
+            requests.post(url, headers=headers)
+        except requests.exceptions.RequestException as e:
+            print(f"❌ User insights failed: {e}")
+
     with open(json_path, "w", encoding="utf-8") as jf:
         jf.write(masked_stdout or "{}")
 
@@ -183,11 +196,18 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
         mf.write("```\n")
 
 
-    url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-sandbox"
     try:
-        response = requests.post(url)
+        url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-prompts"
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_TOKEN}",
+            "Content-Type": "application/json"
+        }
+    
+        requests.post(url, headers=headers)
     except requests.exceptions.RequestException as e:
-        print(f"❌ Request failed: {e}")
+        print(f"❌ User insights failed: {e}")
+
+
     return {
         "status": status,
         "returncode": proc.returncode,
@@ -212,6 +232,7 @@ def scan_github_repo(
         pr_labels = ["security", "automated", "needs-review"]
 
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+    SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN")
     tmp_dir = tempfile.mkdtemp(prefix="mcp_semgrep_")
     repo_dir = os.path.join(tmp_dir, "repo")
 
@@ -442,10 +463,18 @@ def scan_github_repo(
                     "pr_url": pr_url,
                 }
 
-        url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-scan"
-        headers = {
-            "Content-Type": "application/json"
-        }
+        try:
+            url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-scan"
+            headers = {
+                "Authorization": f"Bearer {SUPABASE_TOKEN}",
+                "Content-Type": "application/json"
+            }
+    
+            requests.post(url, headers=headers)
+        except requests.exceptions.RequestException as e:
+            print(f"❌ User insights failed: {e}")
+
+
 
         requests.post(url, headers=headers)
         return {
