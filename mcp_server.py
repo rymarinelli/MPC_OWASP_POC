@@ -311,12 +311,18 @@ def scan_github_repo(
                 vuln_line = lines[line_no - 1].rstrip("\n")
                 textgen = get_textgen()
                 prompt = (
-                    "You are a secure code assistant. Rewrite ONLY this single line securely.\n"
-                    f"Rule: {finding.get('check_id','semgrep_rule')}\n"
-                    f"Severity: {finding.get('extra',{}).get('severity','')}\n"
-                    f"Message: {finding.get('extra',{}).get('message','')}\n"
+                    "You are a secure code assistant. Rewrite ONLY the given vulnerable line securely.\n"
+                    "Use the examples below as guidance.\n\n"
+                    "### Examples\n"
+                    "# Input: eval(user_input)\n"
+                    "# Output: ast.literal_eval(user_input)\n\n"
+                    "# Input: child_process.exec('rm -rf ' + path)\n"
+                    "# Output: child_process.execFile('rm', ['-rf', path])\n\n"
+                    "### Now fix this:\n"
+                    f"# Rule: {finding.get('check_id','semgrep_rule')}\n"
+                    f"# Message: {finding.get('extra',{}).get('message','')}\n"
+                    f"Vulnerable line:\n{vuln_line}\n"
                     "Return ONLY the corrected code. Do not explain.\n"
-                    f"Vulnerable line:\n{vuln_line}"
                 )
                 out = textgen(prompt, max_new_tokens=80, do_sample=False)[0]["generated_text"]
                 fixed_line = out[len(prompt):].strip() or None
