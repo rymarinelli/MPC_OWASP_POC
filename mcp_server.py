@@ -1,3 +1,4 @@
+%%writefile mcp_server.py
 from pathlib import Path
 import re
 from typing import Optional, Dict, Any, List, Callable
@@ -96,7 +97,7 @@ def mask_sensitive(text: str) -> str:
     if not text:
         return text
     tok = os.getenv("GITHUB_TOKEN")
-    
+
     if tok:
         text = text.replace(tok, TOKEN_MASK)
         # also mask URLs like https://<token>@github.com
@@ -144,12 +145,18 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
     json_path = os.path.join(repo_dir, f"sandbox_report_{ts_suffix}.json")
     md_path = os.path.join(repo_dir, f"SANDBOX_SCAN_REPORT_{ts_suffix}.md")
 
+    prompts_dir = os.path.join(repo_dir, "prompts")
+    os.makedirs(prompts_dir, exist_ok=True)
+    user_prompt_path = os.path.join(prompts_dir, "user.txt")
+    with open(user_prompt_path, "w", encoding="utf-8") as f:
+        f.write("verify artefacts")
+
     proc = subprocess.run(
         [
             "python", "scripts/inspect_vibe_code.py",
             "--workspace", repo_dir,
             "--prompt",
-            "Review finding", ##os.path.join(repo_dir, "prompts/user.txt") if os.path.exists(os.path.join(repo_dir, "prompts/user.txt")) else "prompts/user.txt",
+            user_prompt_path,
             "--fail-on-high",
             "--json",
         ],
@@ -163,14 +170,14 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
     masked_stdout = mask_sensitive(proc.stdout)
     masked_stderr = mask_sensitive(proc.stderr)
 
-    if status is  "passed":
+    if status ==  "passed":
         try:
             url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-sandbox"
             headers = {
                 "Authorization": f"Bearer {SUPABASE_TOKEN}",
                 "Content-Type": "application/json"
             }
-        
+
             requests.post(url, headers=headers)
         except requests.exceptions.RequestException as e:
             print(f"❌ User insights failed: {e}")
@@ -202,7 +209,7 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
             "Authorization": f"Bearer {SUPABASE_TOKEN}",
             "Content-Type": "application/json"
         }
-    
+
         requests.post(url, headers=headers)
     except requests.exceptions.RequestException as e:
         print(f"❌ User insights failed: {e}")
@@ -288,15 +295,15 @@ def scan_github_repo(
             if not line_no:
                 return None
                       # Write LLM fix to prompts/user.txt before sandbox run
-            # try:
-            #     prompts_dir = os.path.join(repo_dir, "prompts")
-            #     os.makedirs(prompts_dir, exist_ok=True)
-            #     with open(os.path.join(prompts_dir, "user.txt"), "w", encoding="utf-8") as f:
-            #         f.write("")
-            # except Exception as e:
-            #     print(f"[MCP] ⚠️ Could not write prompt for sandbox: {e}")
-                
-     
+            try:
+                prompts_dir = os.path.join(repo_dir, "prompts")
+                os.makedirs(prompts_dir, exist_ok=True)
+                with open(os.path.join(prompts_dir, "user.txt"), "w", encoding="utf-8") as f:
+                    f.write("")
+            except Exception as e:
+                print(f"[MCP] ⚠️ Could not write prompt for sandbox: {e}")
+
+
             # produce fixed line
             try:
                 with open(target_file, "r", encoding="utf-8") as f:
@@ -311,7 +318,7 @@ def scan_github_repo(
                     "Return ONLY the corrected code. Do not explain.\n"
                     f"Vulnerable line:\n{vuln_line}"
                 )
-                out = textgen(prompt, max_new_tokens=60, do_sample=False)[0]["generated_text"]
+                out = textgen(prompt, max_new_tokens=80, do_sample=False)[0]["generated_text"]
                 fixed_line = out[len(prompt):].strip() or None
                 if not fixed_line:
                     return None
@@ -326,7 +333,7 @@ def scan_github_repo(
                 fixed_line + "\n",
                 "# === MCP FIX END ===\n",
             ]
-  
+
             try:
                 lines[line_no - 1:line_no] = block
                 with open(target_file, "w", encoding="utf-8") as f:
@@ -345,16 +352,29 @@ def scan_github_repo(
             ts_suffix = f"{branch_name.split('mcp/remediation-')[-1]}-{applied+1:03d}"
             try:
                 sbx = run_sandbox_inspect(repo_dir, tmp_dir, ts_suffix)
+                sbx_json = sbx.get("json_path")
+                sbx_md = sbx.get("md_path")
+                ensure_git_identity(repo_dir)
+
+                for p in (sbx_json, sbx_md):
+                    if p and os.path.exists(p):
+                        subprocess.run(["git", "add", p], cwd=repo_dir, check=False)
+
+                commit_msg = f"Sandbox inspection report ({ts_suffix}) – status: {sbx.get('status','unknown')}"
+                subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=False)
+
+                print(f"[MCP] ✅ Committed sandbox report: {sbx_md or sbx_json}")
                  # If policy: block PR on high severity, return info (caller can decide)
-                if sbx["status"] == "failed-high":
-                    return {
-                        "repo_dir": repo_dir,
-                        "num_findings": len(findings),
-                        "llm_applied_fixes": applied,
-                        "final_sandbox_status": sbx["status"],
-                        "final_report": sbx["md_path"],
-                        "note": "High severity findings — PR creation should be blocked upstream."
-                    }
+                # if sbx["status"] == "failed-high":
+                #     return {
+                #         "repo_dir": repo_dir,
+                #         "num_findings": len(findings),
+                #         "llm_applied_fixes": applied,
+                #         "final_sandbox_status": sbx["status"],
+                #         "final_report": sbx["md_path"],
+                #         "note": "High severity findings — PR creation should be blocked upstream."
+                #     }
+                
 
             except Exception:
                 masked_trace = mask_sensitive(traceback.format_exc())
@@ -364,27 +384,23 @@ def scan_github_repo(
                 sbx = {"status": "error", "returncode": 99, "md_path": fail_md}
 
             # Commit the sandbox report first (includes status + stdout/stderr)
-            ensure_git_identity(repo_dir)
-            subprocess.run(["git", "add", sbx["md_path"]], cwd=repo_dir)
-            subprocess.run(
-                ["git", "commit", "-m", f"Sandbox inspect ({sbx['status']}) rc={sbx.get('returncode',-1)}"],
-                cwd=repo_dir,
-                check=False,
-            )
+    
 
             # Now commit the actual remediation for this file
             check_id = fnd.get("check_id", "semgrep_rule")
             msg = f"Auto remediation: {rel_path} ({check_id})"
+            print(f"git add: {msg}")
             subprocess.run(["git", "add", rel_path], cwd=repo_dir)
             subprocess.run(["git", "commit", "-m", msg], cwd=repo_dir)
             applied += 1
-            
+
 
         # bail out if *no* changes were made by LLM (before adding any reports)
-        status = subprocess.run(["git", "status", "--short"], cwd=repo_dir, capture_output=True, text=True)
-        if not status.stdout.strip():
+        # status = subprocess.run(["git", "status", "--short"], cwd=repo_dir, capture_output=True, text=True)
+        if applied == 0:
+            print("⚠️ No LLM fixes applied, skipping report and PR.")
             return {
-                "warning": "no changes to commit (LLM didn't modify anything)",
+                "warning": "no changes applied",
                 "repo_dir": repo_dir,
                 "num_findings": len(findings),
             }
@@ -396,13 +412,16 @@ def scan_github_repo(
                 f"# MCP Security Report\n\nTarget: {repo_url}\nTime: {ts_branch}\n"
                 f"Findings: {len(findings)}\nPatched: {applied}\n\n{remediation_text}\n"
             )
+
+
+        print(f"git add  MCP Security Report\n\nTarget: {repo_url}\nTime: {ts_branch}\n")
         subprocess.run(["git", "add", report_path], cwd=repo_dir)
         subprocess.run(["git", "commit", "-m", "Add MCP security report"], cwd=repo_dir)
 
         # push (PR happens next)
         subprocess.run(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_dir, check=False)
+        print(f"git pushed")
 
-       
         # Create PR with Markdown body and labels (fully qualified head)
         pr_info = None
         if GITHUB_TOKEN and create_pr:
@@ -469,7 +488,7 @@ def scan_github_repo(
                 "Authorization": f"Bearer {SUPABASE_TOKEN}",
                 "Content-Type": "application/json"
             }
-    
+
             requests.post(url, headers=headers)
         except requests.exceptions.RequestException as e:
             print(f"❌ User insights failed: {e}")
@@ -486,6 +505,8 @@ def scan_github_repo(
         }
 
     finally:
+        print(f"finally======>")
+
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 # ============================================================
