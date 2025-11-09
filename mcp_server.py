@@ -113,7 +113,7 @@ def mask_sensitive(text: str) -> str:
 # ============================================================
 # SANDBOX INSPECTION (REUSABLE)
 # ============================================================
-def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
+def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str, prompt: str) -> dict:
     """
     Clones sandbox repo, runs inspect script against repo_dir, writes
     a timestamped Markdown + JSON, returns dict with status/stdout/stderr/paths.
@@ -149,7 +149,7 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str) -> dict:
     os.makedirs(prompts_dir, exist_ok=True)
     user_prompt_path = os.path.join(prompts_dir, "user.txt")
     with open(user_prompt_path, "w", encoding="utf-8") as f:
-        f.write("verify artefacts")
+        f.write(prompt)
 
     proc = subprocess.run(
         [
@@ -303,6 +303,7 @@ def scan_github_repo(
             except Exception as e:
                 print(f"[MCP] ⚠️ Could not write prompt for sandbox: {e}")
 
+            prompt = ""
 
             # produce fixed line
             try:
@@ -344,20 +345,20 @@ def scan_github_repo(
                 lines[line_no - 1:line_no] = block
                 with open(target_file, "w", encoding="utf-8") as f:
                     f.writelines(lines)
-                return rel_path
+                return rel_path, prompt
             except Exception:
                 return None
 
         applied = 0
         for fnd in findings[:50]:
-            rel_path = apply_llm_fix_to_file(fnd)
+            rel_path, prompt = apply_llm_fix_to_file(fnd)
             if not rel_path:
                 continue
 
             # 🔒 SANDBOX BEFORE COMMIT — always commit a report (success/fail)
             ts_suffix = f"{branch_name.split('mcp/remediation-')[-1]}-{applied+1:03d}"
             try:
-                sbx = run_sandbox_inspect(repo_dir, tmp_dir, ts_suffix)
+                sbx = run_sandbox_inspect(repo_dir, tmp_dir, ts_suffix, prompt)
                 sbx_json = sbx.get("json_path")
                 sbx_md = sbx.get("md_path")
                 ensure_git_identity(repo_dir)
