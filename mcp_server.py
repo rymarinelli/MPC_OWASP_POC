@@ -247,6 +247,7 @@ def scan_github_repo(
     repo_dir = os.path.join(tmp_dir, "repo")
 
     try:
+        repo_url_webhook = re.sub(r"^https://github\.com/", "", repo_url).replace(".git", "").strip("/")
         requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
@@ -256,7 +257,6 @@ def scan_github_repo(
                 "data": {"step": "auth", "message": "Authenticating GitHub user..."}
             }
         )
-        repo_url_webhook = re.sub(r"^https://github\.com/", "", repo_url).replace(".git", "").strip("/")
 
         # --- clone ---
         parts = repo_url.rstrip("/").split("/")
