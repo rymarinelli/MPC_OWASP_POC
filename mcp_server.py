@@ -251,26 +251,29 @@ def scan_github_repo(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
             json={
-                "repo": repo_url,
+                "repo": repo_url_webhook,
                 "type": "status",
                 "data": {"step": "auth", "message": "Authenticating GitHub user..."}
             }
         )
+        repo_url_webhook = re.sub(r"^https://github\.com/", "", repo_url).replace(".git", "").strip("/")
+
         # --- clone ---
         parts = repo_url.rstrip("/").split("/")
+        
         owner, repo = parts[-2], parts[-1]
         clone_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{repo}.git" if GITHUB_TOKEN else f"https://github.com/{owner}/{repo}.git"
         requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
-            json={"repo": repo_url, "type": "status", "data": {"step": "scan", "message": "Analyzing project structure..."}}
+            json={"repo": repo_url_webhook, "type": "status", "data": {"step": "scan", "message": "Analyzing project structure..."}}
         )
 
         requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
             json={
-                "repo": repo_url,
+                "repo": repo_url_webhook,
                 "type": "status",
                 "data": {"step": "context", "message": "Cloning repository for analysis..."}
             }
@@ -293,7 +296,7 @@ def scan_github_repo(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
             json={
-                "repo": repo_url,
+                "repo": repo_url_webhook,
                 "type": "status",
                 "data": {"step": "scan", "message": "Scanning project for security issues..."}
             }
@@ -315,7 +318,7 @@ def scan_github_repo(
         requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
-            json={"repo": repo_url, "type": "status", "data": {"step": "analyze", "message": findings_message}}
+            json={"repo": repo_url_webhook, "type": "status", "data": {"step": "analyze", "message": findings_message}}
         )
         remediation_text = hf_remediation_from_findings(findings) if llm_proposal else ""
        
@@ -390,7 +393,7 @@ def scan_github_repo(
             except Exception:
                 return None
 
-         requests.post(
+        requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
             json={"repo": "victorstrandmoe97/python-example-projects", "type": "status", "data": {"step": "risk", "message": "Generating remediation plan..."}}
@@ -423,7 +426,7 @@ def scan_github_repo(
                         "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
                         headers={"Content-Type": "application/json"},
                         json={
-                            "repo": repo_url,
+                            "repo": repo_url_webhook,
                             "type": "commit",
                             "data": {
                                 "sha": sha,
@@ -443,7 +446,7 @@ def scan_github_repo(
                         "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
                         headers={"Content-Type": "application/json"},
                         json={
-                            "repo": repo_url,
+                            "repo": repo_url_webhook,
                             "type": "sandbox",
                             "data": {
                                 "id": ts_suffix,
@@ -578,7 +581,7 @@ def scan_github_repo(
                 "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
                 headers={"Content-Type": "application/json"},
                 json={
-                    "repo": repo_url,
+                    "repo": repo_url_webhook,
                     "type": "pr",
                     "data": {"url": pr_html_url, "status": "open"},
                 },
