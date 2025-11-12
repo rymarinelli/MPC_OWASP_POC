@@ -3,11 +3,14 @@ from pathlib import Path
 import re
 from typing import Optional, Dict, Any, List, Callable
 import sys, inspect, os, json, subprocess, socket, tempfile, shutil, requests, traceback
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header,Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 import uvicorn
 from transformers import pipeline
 from fastmcp import FastMCP
-import os, json, tempfile, shutil, subprocess, traceback, requests
+import os, json, tempfile, shutil, subprocess, traceback
 from pathlib import Path
 from datetime import datetime
 # ============================================================
@@ -244,11 +247,34 @@ def scan_github_repo(
     repo_dir = os.path.join(tmp_dir, "repo")
 
     try:
+        requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={
+                "repo": repo_url,
+                "type": "status",
+                "data": {"step": "auth", "message": "Authenticating GitHub user..."}
+            }
+        )
         # --- clone ---
         parts = repo_url.rstrip("/").split("/")
         owner, repo = parts[-2], parts[-1]
         clone_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{repo}.git" if GITHUB_TOKEN else f"https://github.com/{owner}/{repo}.git"
+        requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={"repo": repo_url, "type": "status", "data": {"step": "scan", "message": "Analyzing project structure..."}}
+        )
 
+        requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={
+                "repo": repo_url,
+                "type": "status",
+                "data": {"step": "context", "message": "Cloning repository for analysis..."}
+            }
+        )
         for branch_try in (base_branch, "master"):
             clone_proc = subprocess.run(
                 ["git", "clone", "--depth", "1", "--branch", branch_try, clone_url, repo_dir],
@@ -263,6 +289,15 @@ def scan_github_repo(
         if not os.path.isdir(os.path.join(repo_dir, ".git")):
             return {"error": "repo cloned but .git missing", "repo_dir": repo_dir}
 
+        requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={
+                "repo": repo_url,
+                "type": "status",
+                "data": {"step": "scan", "message": "Scanning project for security issues..."}
+            }
+        )
         # --- semgrep ---
         semgrep_cmd = [
             "semgrep","scan","--json",
@@ -276,8 +311,14 @@ def scan_github_repo(
         except Exception:
             findings = []
 
+        findings_message = f"Found {len(findings)} security issues"
+        requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={"repo": repo_url, "type": "status", "data": {"step": "analyze", "message": findings_message}}
+        )
         remediation_text = hf_remediation_from_findings(findings) if llm_proposal else ""
-
+       
         ensure_git_identity(repo_dir)
         ts_branch = datetime.utcnow().strftime("%a-%d-%b-%Y-%H%MUTC")  # Thu-06-Nov-2025-1423UTC
         branch_name = f"mcp/remediation-{ts_branch}"
@@ -349,6 +390,12 @@ def scan_github_repo(
             except Exception:
                 return None
 
+         requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={"repo": "victorstrandmoe97/python-example-projects", "type": "status", "data": {"step": "risk", "message": "Generating remediation plan..."}}
+        )
+
         applied = 0
         for fnd in findings[:50]:
             rel_path, prompt = apply_llm_fix_to_file(fnd)
@@ -369,8 +416,44 @@ def scan_github_repo(
 
                 commit_msg = f"Sandbox inspection report ({ts_suffix}) – status: {sbx.get('status','unknown')}"
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=False)
+                # --- webhook: commit ---
+                try:
+                    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True).stdout.strip()
+                    requests.post(
+                        "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "repo": repo_url,
+                            "type": "commit",
+                            "data": {
+                                "sha": sha,
+                                "message": msg,
+                                "author": "MCP Agent",
+                                "url": f"https://github.com/{owner}/{repo}/commit/{sha}",
+                            },
+                        },
+                    )
+                except Exception as e:
+                    print(f"⚠️ Commit webhook failed: {e}")
 
                 print(f"[MCP] ✅ Committed sandbox report: {sbx_md or sbx_json}")
+                # --- webhook: sandbox ---
+                try:
+                    requests.post(
+                        "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "repo": repo_url,
+                            "type": "sandbox",
+                            "data": {
+                                "id": ts_suffix,
+                                "status": sbx.get("status", "unknown"),
+                                "commit": subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True).stdout.strip(),
+                            },
+                        },
+                    )
+                except Exception as e:
+                    print(f"⚠️ Sandbox webhook failed: {e}")
                  # If policy: block PR on high severity, return info (caller can decide)
                 # if sbx["status"] == "failed-high":
                 #     return {
@@ -381,7 +464,7 @@ def scan_github_repo(
                 #         "final_report": sbx["md_path"],
                 #         "note": "High severity findings — PR creation should be blocked upstream."
                 #     }
-                
+
 
             except Exception:
                 masked_trace = mask_sensitive(traceback.format_exc())
@@ -391,7 +474,7 @@ def scan_github_repo(
                 sbx = {"status": "error", "returncode": 99, "md_path": fail_md}
 
             # Commit the sandbox report first (includes status + stdout/stderr)
-    
+
 
             # Now commit the actual remediation for this file
             check_id = fnd.get("check_id", "semgrep_rule")
@@ -489,6 +572,20 @@ def scan_github_repo(
                     "pr_url": pr_url,
                 }
 
+        # --- webhook: pull request ---
+        try:
+            requests.post(
+                "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "repo": repo_url,
+                    "type": "pr",
+                    "data": {"url": pr_html_url, "status": "open"},
+                },
+            )
+        except Exception as e:
+            print(f"⚠️ PR webhook failed: {e}")
+
         try:
             url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-scan"
             headers = {
@@ -520,7 +617,25 @@ def scan_github_repo(
 # FASTAPI SERVER
 # ============================================================
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],            # or ["https://vanguard-ai-sparkle-30958.lovable.app"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,        # must be False when using "*"
+)
 
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(request: Request, rest_of_path: str):
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 @app.get("/")
 async def root():
     return {"status": "ok", "tools": list(TOOL_REGISTRY.keys()), "ip": get_ip()}
@@ -544,6 +659,8 @@ async def call_tool(payload: Dict[str, Any], x_api_key: Optional[str] = Header(d
         result = {"error": str(e), "trace": traceback.format_exc()}
 
     return result
+
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
