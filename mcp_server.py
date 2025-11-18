@@ -19,6 +19,8 @@ API_KEY = os.getenv("MCP_HTTP_API_KEY")
 HF_MODEL_ID = os.getenv("HF_MODEL_ID", "ise-uiuc/Magicoder-CL-7B")
 BACKUP_DIR = os.getenv("MCP_BACKUP_DIR", ".mcp_backups")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+TSDB_API_KEY = os.getenv("TSDB_API_KEY")
+TSDB_ENDPOINT = os.getenv("TSDB_ENDPOINT")
 
 # ============================================================
 # UTILITIES
@@ -95,29 +97,38 @@ def stable_uid(rule_id: str, file_path: str, code: str) -> str:
 def extract_vulns(snapshot: dict) -> Dict[str, dict]:
     """
     Extract normalized vulnerabilities from an MCP scan snapshot.
-    Expected MCP format:
-        snapshot["findings"] = [{ rule_id, file, code_excerpt, ... }]
-    Returns:
-        { vuln_uid: vuln_record }
+    FLATTEN Semgrep metadata → keep only minimal fields needed for analytics.
     """
     vulns: Dict[str, dict] = {}
+
     for f in snapshot.get("findings", []):
         rule_id = f.get("rule_id")
         file_path = f.get("file")
         code = f.get("code_excerpt", "") or ""
+        severity = f.get("severity")
+
+        # Semgrep raw
+        raw = (f.get("raw") or {})
+        extra = (raw.get("extra") or {})
 
         uid = stable_uid(rule_id or "", file_path or "", code)
 
-        vulns[uid] = {
+        vuln = {
             "uid": uid,
             "rule_id": rule_id,
             "file": file_path,
             "code": code,
-            "severity": f.get("severity"),
-            "metadata": f,
+            "severity": severity,
+            # flatten fields you asked for
+            "semgrep_fingerprint": extra.get("fingerprint"),
+            "asvs": (extra.get("metadata") or {}).get("asvs"),
+            "owasp": (extra.get("metadata") or {}).get("owasp"),
+            "references": (extra.get("metadata") or {}).get("references"),
         }
-    return vulns
 
+        vulns[uid] = vuln
+
+    return vulns
 
 def compute_diff(prev: Dict[str, dict], curr: Dict[str, dict]) -> dict:
     prev_set = set(prev.keys())
@@ -205,6 +216,73 @@ def topic_model_vulns(vuln_records: Dict[str, dict]) -> Dict[str, str]:
     # For now just echo rule_id as pseudo-topic
     return {uid: (v.get("rule_id") or "unknown") for uid, v in vuln_records.items()}
 
+def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
+    """
+    Push commit-level vulnerability data into a time-series backend.
+
+    Shape (generic JSON for an HTTP ingester):
+      - One summary point per commit
+      - One point per vuln present in that commit
+    """
+    if not TSDB_ENDPOINT:
+        # TSDB not configured; skip silently
+        return
+
+    points: List[dict] = []
+
+    commit_sha = report.get("commit_sha")
+    ts_iso = report.get("timestamp")  # ISO-8601 UTC
+    stats = report.get("stats", {}) or {}
+    vulns = report.get("vulns", {}) or {}
+
+    # --- summary point per commit ---
+    points.append({
+        "measurement": "vuln_commit_summary",
+        "time": ts_iso,
+        "tags": {
+            "owner": owner,
+            "repo": repo,
+            "commit_sha": commit_sha,
+        },
+        "fields": {
+            "total": int(stats.get("total", 0) or 0),
+            "added": int(stats.get("added", 0) or 0),
+            "removed": int(stats.get("removed", 0) or 0),
+            "persisted": int(stats.get("persisted", 0) or 0),
+        },
+    })
+
+    # --- per-vuln point (presence at this commit) ---
+    for uid, v in vulns.items():
+        points.append({
+            "measurement": "vuln_state",
+            "time": ts_iso,
+            "tags": {
+                "owner": owner,
+                "repo": repo,
+                "commit_sha": commit_sha,
+                "vuln_uid": uid,
+                "rule_id": v.get("rule_id") or "",
+                "severity": v.get("severity") or "",
+            },
+            "fields": {
+                # 1 = present in this commit; you can later detect "resolved"
+                # via the time_to_fix_store or by diffing across commits.
+                "is_present": 1,
+            },
+        })
+
+    headers = {"Content-Type": "application/json"}
+    if TSDB_API_KEY:
+        headers["Authorization"] = f"Bearer {TSDB_API_KEY}"
+
+    try:
+        resp = requests.post(TSDB_ENDPOINT, headers=headers, json=points, timeout=5)
+        if resp.status_code >= 400:
+            print(f"[MCP] ⚠️ TSDB push HTTP {resp.status_code}: {resp.text[:300]}")
+    except requests.RequestException as e:
+        print(f"[MCP] ⚠️ TSDB push failed: {e}")
+
 
 def build_commit_report(
         commit_sha: str,
@@ -213,7 +291,9 @@ def build_commit_report(
         prev_snapshot_path: Optional[str],
         ttf_store_path: str,
         sandbox_path: str,
-        output_dir: str):
+        output_dir: str,
+        owner: str,
+        repo: str):
 
     curr = extract_vulns(load_json(curr_snapshot_path))
     prev = extract_vulns(load_json(prev_snapshot_path)) if prev_snapshot_path else {}
@@ -247,6 +327,15 @@ def build_commit_report(
 
     out_path = Path(output_dir) / f"commit_report_{commit_sha}.json"
     write_json(out_path, report)
+    out_path = Path(output_dir) / f"commit_report_{commit_sha}.json"
+    write_json(out_path, report)
+
+    # 🔄 mirror into time-series DB
+    try:
+        push_commit_report_to_timeseries(report, owner=owner, repo=repo)
+    except Exception as e:
+        print(f"[MCP] ⚠️ Failed to push commit report to TSDB: {e}")
+
     return out_path
 
 
@@ -726,6 +815,8 @@ def scan_github_repo(
                     ttf_store_path=ttf_store_path,
                     sandbox_path=repo_dir,
                     output_dir=commit_reports_dir,
+                    owner=owner,
+                    repo=repo,
                 )
                 prev_snapshot_path = curr_snapshot_path
 
