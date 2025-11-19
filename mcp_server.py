@@ -6,7 +6,14 @@ import sys, inspect, os, json, subprocess, socket, tempfile, shutil, requests, t
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
+from durinn_topic_model import topic_model_vulns
+from durinn_topic_drift import (
+    topic_distribution,
+    kl_divergence,
+    jaccard_drift,
+    topic_heatmap_points,
+    topic_drift_points
+)
 import uvicorn
 from transformers import pipeline
 from fastmcp import FastMCP
@@ -85,14 +92,20 @@ def write_json(path: str | Path, data: dict):
         json.dump(data, f, indent=2)
 
 
-def stable_uid(rule_id: str, file_path: str, code: str) -> str:
-    """Normalize vulnerability identity using hash of rule + path + code."""
+def stable_uid(rule_id: str, file_path: str, f: dict) -> str:
+    fp = (f.get("raw") or {}).get("extra", {}).get("fingerprint")
+    if fp:
+        return fp
+
+    # fallback if no fingerprint exists
+    start = (f.get("raw") or {}).get("start", {}).get("line", "")
+    end   = (f.get("raw") or {}).get("end", {}).get("line", "")
+
     h = hashlib.sha1()
     h.update((rule_id or "").encode())
     h.update((file_path or "").encode())
-    h.update((code or "").encode())
+    h.update(f"{start}-{end}".encode())
     return h.hexdigest()
-
 
 def extract_vulns(snapshot: dict) -> Dict[str, dict]:
     """
@@ -111,7 +124,7 @@ def extract_vulns(snapshot: dict) -> Dict[str, dict]:
         raw = (f.get("raw") or {})
         extra = (raw.get("extra") or {})
 
-        uid = stable_uid(rule_id or "", file_path or "", code)
+        uid = stable_uid(rule_id or "", file_path or "", f)
 
         vuln = {
             "uid": uid,
@@ -223,19 +236,34 @@ def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
     Shape (generic JSON for an HTTP ingester):
       - One summary point per commit
       - One point per vuln present in that commit
+      - One point per topic frequency (heatmap)
     """
     if not TSDB_ENDPOINT:
-        # TSDB not configured; skip silently
         return
 
     points: List[dict] = []
 
+    # Extract fields from report FIRST
     commit_sha = report.get("commit_sha")
     ts_iso = report.get("timestamp")  # ISO-8601 UTC
     stats = report.get("stats", {}) or {}
     vulns = report.get("vulns", {}) or {}
+    topics = report.get("topics", {}) or {}
 
-    # --- summary point per commit ---
+    # ----- Topic Heatmap -----
+    try:
+        topic_points = topic_heatmap_points(
+            commit_sha=commit_sha,
+            timestamp=ts_iso,
+            topics=topics,
+            owner=owner,
+            repo=repo
+        )
+        points.extend(topic_points)
+    except Exception as e:
+        print(f"[MCP] ⚠️ Topic heatmap generation failed: {e}")
+
+    # ----- Summary point per commit -----
     points.append({
         "measurement": "vuln_commit_summary",
         "time": ts_iso,
@@ -252,7 +280,7 @@ def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
         },
     })
 
-    # --- per-vuln point (presence at this commit) ---
+    # ----- per-vuln point -----
     for uid, v in vulns.items():
         points.append({
             "measurement": "vuln_state",
@@ -266,12 +294,11 @@ def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
                 "severity": v.get("severity") or "",
             },
             "fields": {
-                # 1 = present in this commit; you can later detect "resolved"
-                # via the time_to_fix_store or by diffing across commits.
                 "is_present": 1,
             },
         })
 
+    # ----- Send all points -----
     headers = {"Content-Type": "application/json"}
     if TSDB_API_KEY:
         headers["Authorization"] = f"Bearer {TSDB_API_KEY}"
@@ -295,11 +322,14 @@ def build_commit_report(
         owner: str,
         repo: str):
 
+    # ---- Extract vuln sets ----
     curr = extract_vulns(load_json(curr_snapshot_path))
     prev = extract_vulns(load_json(prev_snapshot_path)) if prev_snapshot_path else {}
 
+    # ---- Diff ----
     diff = compute_diff(prev, curr)
 
+    # ---- Time-to-fix store update ----
     ttf_store = update_ttf_store(
         ttf_store_path,
         commit_sha,
@@ -307,8 +337,27 @@ def build_commit_report(
         diff
     )
 
+    # ---- Topic modeling (current commit) ----
     topics = topic_model_vulns(curr)
 
+    # ---- Topic modeling (previous commit) ----
+    if prev_snapshot_path:
+        prev_snapshot = load_json(prev_snapshot_path)
+        prev_vulns = extract_vulns(prev_snapshot)
+        prev_topics = topic_model_vulns(prev_vulns)
+    else:
+        prev_topics = {}
+
+    # ---- Drift calculation ----
+    curr_dist = topic_distribution(topics)
+    prev_dist = topic_distribution(prev_topics)
+
+    topic_drift = {
+        "jaccard": jaccard_drift(prev_topics, topics),
+        "kl_divergence": kl_divergence(prev_dist, curr_dist)
+    }
+
+    # ---- Build final report JSON ----
     report = {
         "commit_sha": commit_sha,
         "timestamp": timestamp,
@@ -321,16 +370,15 @@ def build_commit_report(
         "diff": diff,
         "vulns": curr,
         "topics": topics,
+        "topic_drift": topic_drift,
         "time_to_fix_store": ttf_store,
-        # sandbox integration can be layered on top later if you want per-commit mapping
     }
 
-    out_path = Path(output_dir) / f"commit_report_{commit_sha}.json"
-    write_json(out_path, report)
+    # ---- Write commit report file ----
     out_path = Path(output_dir) / f"commit_report_{commit_sha}.json"
     write_json(out_path, report)
 
-    # 🔄 mirror into time-series DB
+    # ---- Send to TSDB ----
     try:
         push_commit_report_to_timeseries(report, owner=owner, repo=repo)
     except Exception as e:
