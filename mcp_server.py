@@ -220,15 +220,6 @@ def update_ttf_store(ttf_path: str, commit_sha: str, timestamp: str,
     return store
 
 
-def topic_model_vulns(vuln_records: Dict[str, dict]) -> Dict[str, str]:
-    """
-    Stub: plug in your real embedding + clustering pipeline.
-    Return:
-        { vuln_uid: topic_cluster }
-    """
-    # For now just echo rule_id as pseudo-topic
-    return {uid: (v.get("rule_id") or "unknown") for uid, v in vuln_records.items()}
-
 def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
     """
     Push commit-level vulnerability data into a time-series backend.

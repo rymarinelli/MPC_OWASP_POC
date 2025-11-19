@@ -1,13 +1,7 @@
-# durinn_topic_model.py
-"""
-Real topic modeling pipeline for vulnerability records.
+%%writefile durinn_topic_model.py
 
-Steps:
-1. Build a text representation of each vulnerability (rule_id + snippet)
-2. Encode using sentence-transformers
-3. Dimensionality reduction (optional)
-4. Clustering (HDBSCAN)
-5. LLM cluster labeling (optional but recommended)
+"""
+Topic modeling for vulnerability records using embeddings + HDBSCAN + Magicoder cluster labeling.
 """
 
 from typing import Dict, List
@@ -19,33 +13,51 @@ import hashlib
 import json
 import os
 import time
-import openai   # or use your internal LLM call
+from transformers import pipeline
 
 # --------------------------------------
 # CONFIG
 # --------------------------------------
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-USE_UMAP = False     # set True if you want cleaner clusters
+USE_UMAP = False               # optional dimensionality reduction
 CLUSTER_MIN_SIZE = 2
-LLM_MODEL = "gpt-4o-mini"  # or local model
+MAGICODER_MODEL = "ise-uiuc/Magicoder-CL-7B"   # your local HF model
 
 
 # --------------------------------------
-# GLOBAL MODEL (cached)
+# GLOBAL MODELS
 # --------------------------------------
-_model = None
-def get_embedding_model():
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(EMBED_MODEL)
-    return _model
+_embed_model = None
+_magicoder = None
+
+
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        _embed_model = SentenceTransformer(EMBED_MODEL)
+    return _embed_model
+
+
+def get_magicoder():
+    """
+    Create Magicoder generation pipeline once and reuse it.
+    """
+    global _magicoder
+    if _magicoder is None:
+        _magicoder = pipeline(
+            "text-generation",
+            model=MAGICODER_MODEL,
+            trust_remote_code=True,
+            device=0  # GPU, or use `None` for CPU
+        )
+    return _magicoder
 
 
 # --------------------------------------
 # UTIL
 # --------------------------------------
 def vuln_to_text(v: dict) -> str:
-    """Create a useful text description of the vuln for embeddings."""
+    """Clean text representation of a vulnerability."""
     return (
         f"rule:{v.get('rule_id','')}\n"
         f"severity:{v.get('severity','')}\n"
@@ -56,36 +68,42 @@ def vuln_to_text(v: dict) -> str:
 
 def llm_label_cluster(samples: List[str]) -> str:
     """
-    Summarize the theme of a cluster using an LLM.
-    Takes the first 4 samples.
+    Summarize the cluster theme using Magicoder.
+    Returns 1–3 word kebab-case label.
     """
     if not samples:
         return "misc"
 
     prompt = (
         "You are a senior application security researcher. "
-        "Given these code vulnerability descriptions, produce a short 1-3 word topic name, "
-        "kebab-case, describing the common theme.\n\n"
+        "Given these vulnerability descriptions, produce a short 1–3 word topic name "
+        "in kebab-case describing the common theme.\n\n"
         "Examples:\n"
-        " - 'hardcoded-secrets'\n"
-        " - 'unsafe-file-access'\n"
-        " - 'sql-injection'\n"
-        " - 'crypto-misuse'\n"
-        " - 'authz-bypass'\n\n"
-        "Vulnerabilities:\n"
-        + "\n---\n".join(samples[:4]) +
-        "\n\nReturn ONLY the short kebab-case topic name."
+        "- hardcoded-secrets\n"
+        "- unsafe-file-access\n"
+        "- sql-injection\n"
+        "- authz-bypass\n"
+        "- crypto-misuse\n\n"
+        "Vulnerabilities:\n" +
+        "\n---\n".join(samples[:4]) +
+        "\n\nReturn ONLY the kebab-case topic name, no explanation:"
     )
 
     try:
-        resp = openai.ChatCompletion.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=15,
-            temperature=0.2,
-        )
-        out = resp["choices"][0]["message"]["content"].strip()
-        return out
+        gen = get_magicoder()(
+            prompt,
+            max_new_tokens=20,
+            do_sample=False
+        )[0]["generated_text"]
+
+        # Extract only the answer (Magicoder sometimes echoes)
+        out = gen[len(prompt):].strip()
+        out = out.split("\n")[0].strip()
+
+        # Sanitize output → kebab-case
+        out = out.lower().replace(" ", "-")
+        return out or "misc"
+
     except Exception:
         return "misc"
 
@@ -95,8 +113,10 @@ def llm_label_cluster(samples: List[str]) -> str:
 # --------------------------------------
 def topic_model_vulns(vuln_records: Dict[str, dict]) -> Dict[str, str]:
     """
-    Mapping:
-        uid -> topic label
+    Input:
+        { vuln_uid: vuln_record }
+    Output:
+        { vuln_uid: topic_label }
     """
     if not vuln_records:
         return {}
@@ -104,25 +124,24 @@ def topic_model_vulns(vuln_records: Dict[str, dict]) -> Dict[str, str]:
     uids = list(vuln_records.keys())
     texts = [vuln_to_text(v) for v in vuln_records.values()]
 
-    # -------------------------
-    # 1. EMBEDDINGS
-    # -------------------------
-    model = get_embedding_model()
+    # --------------------------------------
+    # 1) Embeddings
+    # --------------------------------------
+    model = get_embed_model()
     embeddings = model.encode(texts, show_progress_bar=False)
 
-    # -------------------------
-    # 2. OPTIONAL: DIM REDUCT
-    # -------------------------
+    # --------------------------------------
+    # 2) Dimensionality reduction (optional)
+    # --------------------------------------
     if USE_UMAP:
         reducer = umap.UMAP(n_neighbors=15, min_dist=0.1)
-        emb_small = reducer.fit_transform(embeddings)
-        X = emb_small
+        X = reducer.fit_transform(embeddings)
     else:
         X = embeddings
 
-    # -------------------------
-    # 3. HDBSCAN CLUSTERING
-    # -------------------------
+    # --------------------------------------
+    # 3) HDBSCAN clustering
+    # --------------------------------------
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=CLUSTER_MIN_SIZE,
         metric="euclidean",
@@ -130,23 +149,23 @@ def topic_model_vulns(vuln_records: Dict[str, dict]) -> Dict[str, str]:
     )
     labels = clusterer.fit_predict(X)
 
-    # -------------------------
-    # 4. LABEL CLUSTERS USING LLM
-    # -------------------------
-    cluster_texts = {}
-    for idx, cid in enumerate(labels):
-        cluster_texts.setdefault(cid, []).append(texts[idx])
+    # --------------------------------------
+    # 4) Cluster labeling using Magicoder
+    # --------------------------------------
+    cluster_samples = {}
+    for i, cid in enumerate(labels):
+        cluster_samples.setdefault(cid, []).append(texts[i])
 
     cluster_names = {}
-    for cid, samples in cluster_texts.items():
+    for cid, samples in cluster_samples.items():
         if cid == -1:
             cluster_names[cid] = "misc"
         else:
             cluster_names[cid] = llm_label_cluster(samples)
 
-    # -------------------------
-    # 5. MAP UID -> TOPIC LABEL
-    # -------------------------
+    # --------------------------------------
+    # 5) Map UIDs → cluster names
+    # --------------------------------------
     return {
         uids[i]: cluster_names[labels[i]]
         for i in range(len(uids))

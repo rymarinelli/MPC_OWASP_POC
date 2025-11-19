@@ -1,84 +1,112 @@
+%%writefile durinn_topic_drift.py
 # durinn_topic_drift.py
 """
-Topic drift + commit → topic heatmap utilities.
+Topic drift analytics support module.
 
-Works with output from topic_model_vulns().
+Functions:
+- topic_distribution(topics)
+- kl_divergence(prev_dist, curr_dist)
+- jaccard_drift(prev_topics, curr_topics)
+- topic_heatmap_points(commit_sha, timestamp, topics, owner, repo)
+- topic_drift_points(commit_sha, timestamp, drift_dict, owner, repo)
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import math
 from collections import Counter
 
 
-# -----------------------------------------------------------
-# 1. Compute topic distribution for a commit
-# -----------------------------------------------------------
-def topic_distribution(topics: Dict[str, str]) -> Dict[str, int]:
-    return dict(Counter(topics.values()))
+# ------------------------------------------------------------
+# Topic Distribution
+# ------------------------------------------------------------
+def topic_distribution(topics: Dict[str, str]) -> Dict[str, float]:
+    """
+    Convert topic labels into normalized frequency distribution.
+
+    Input:
+        { uid: "sql-injection" }
+
+    Output:
+        { "sql-injection": 0.44, "misc": 0.12, ... }
+    """
+    if not topics:
+        return {}
+
+    counts = Counter(topics.values())
+    total = sum(counts.values())
+    return {topic: count / total for topic, count in counts.items()}
 
 
-# -----------------------------------------------------------
-# 2. KL Divergence for drift between two topic distributions
-# -----------------------------------------------------------
-def kl_divergence(p: Dict[str, int], q: Dict[str, int]) -> float:
-    # Convert to probability distributions
-    total_p = sum(p.values()) or 1
-    total_q = sum(q.values()) or 1
+# ------------------------------------------------------------
+# KL Divergence
+# ------------------------------------------------------------
+def kl_divergence(prev: Dict[str, float], curr: Dict[str, float]) -> float:
+    """
+    KL divergence between two discrete distributions.
+    Missing keys are treated as epsilon.
+    """
+    if not prev or not curr:
+        return 0.0
 
-    keys = set(p.keys()) | set(q.keys())
-    kl = 0.0
+    epsilon = 1e-8
+    all_keys = set(prev) | set(curr)
 
-    for k in keys:
-        p_k = p.get(k, 0) / total_p
-        q_k = q.get(k, 0) / total_q
+    divergence = 0.0
+    for k in all_keys:
+        p = prev.get(k, epsilon)
+        q = curr.get(k, epsilon)
+        divergence += p * math.log(p / q)
 
-        if p_k > 0 and q_k > 0:
-            kl += p_k * math.log(p_k / q_k)
-        elif p_k > 0 and q_k == 0:
-            # Full surprise
-            kl += p_k * math.log(p_k / 1e-9)
-
-    return kl
+    return float(divergence)
 
 
-# -----------------------------------------------------------
-# 3. Jaccard distance (simple drift)
-# -----------------------------------------------------------
+# ------------------------------------------------------------
+# Jaccard Drift
+# ------------------------------------------------------------
 def jaccard_drift(prev_topics: Dict[str, str], curr_topics: Dict[str, str]) -> float:
+    """
+    Jaccard similarity of topic *sets*, returned as drift (1 - similarity):
+
+    Drift = 1 - |Intersection| / |Union|
+
+    Used to measure qualitative change in topic composition.
+    """
     prev_set = set(prev_topics.values())
     curr_set = set(curr_topics.values())
+
+    if not prev_set and not curr_set:
+        return 0.0
+
     intersection = len(prev_set & curr_set)
     union = len(prev_set | curr_set)
-    if union == 0:
-        return 0.0
-    return 1 - (intersection / union)
+
+    similarity = intersection / union
+    drift = 1.0 - similarity
+    return float(drift)
 
 
-# -----------------------------------------------------------
-# 4. Heatmap rows for TSDB ingestion
-# -----------------------------------------------------------
-def topic_heatmap_points(
-    commit_sha: str,
-    timestamp: str,
-    topics: Dict[str, str],
-    owner: str,
-    repo: str
-):
+# ------------------------------------------------------------
+# Heatmap Points (TSDB)
+# ------------------------------------------------------------
+def topic_heatmap_points(commit_sha: str,
+                         timestamp: str,
+                         topics: Dict[str, str],
+                         owner: str,
+                         repo: str) -> List[dict]:
     """
-    Return a list of time-series ready "topic frequency" points:
-    
-    Example:
-    {
-      measurement: "topic_heatmap",
-      time: <ISO>,
-      tags: { owner, repo, commit_sha, topic },
-      fields: { count: <int> }
-    }
+    For each topic T, emit one TSDB heatmap point:
+
+    measurement: "topic_heatmap"
+    tags: owner, repo, commit_sha, topic
+    fields: count
     """
-    dist = Counter(topics.values())
+    if not topics:
+        return []
+
+    counts = Counter(topics.values())
+
     points = []
-
-    for topic, count in dist.items():
+    for topic, count in counts.items():
         points.append({
             "measurement": "topic_heatmap",
             "time": timestamp,
@@ -86,39 +114,52 @@ def topic_heatmap_points(
                 "owner": owner,
                 "repo": repo,
                 "commit_sha": commit_sha,
-                "topic": topic
+                "topic": topic,
             },
             "fields": {
-                "count": int(count)
-            }
+                "count": int(count),
+            },
         })
+
     return points
 
-def topic_drift_points(
-    commit_sha: str,
-    timestamp: str,
-    drift: dict,
-    owner: str,
-    repo: str
-):
-    """
-    Drift metrics → TSDB rows.
-    Example:
-      measurement: "topic_drift"
-      tags: { owner, repo, commit_sha }
-      fields: { jaccard: 0.55, kl_divergence: 1.38 }
-    """
 
-    return [{
-        "measurement": "topic_drift",
-        "time": timestamp,
-        "tags": {
-            "owner": owner,
-            "repo": repo,
-            "commit_sha": commit_sha
-        },
-        "fields": {
-            "jaccard": float(drift.get("jaccard", 0.0)),
-            "kl_divergence": float(drift.get("kl_divergence", 0.0))
+# ------------------------------------------------------------
+# Topic Drift Points (Optional TSDB)
+# ------------------------------------------------------------
+def topic_drift_points(commit_sha: str,
+                       timestamp: str,
+                       drift: Dict[str, float],
+                       owner: str,
+                       repo: str) -> List[dict]:
+    """
+    Converts drift metrics into TSDB time-series points.
+
+    Example drift dict:
+        {
+            "jaccard": 0.18,
+            "kl_divergence": 0.52
         }
-    }]
+
+    Emits one point per metric.
+    """
+    if not drift:
+        return []
+
+    points = []
+    for metric, value in drift.items():
+        points.append({
+            "measurement": "topic_drift",
+            "time": timestamp,
+            "tags": {
+                "owner": owner,
+                "repo": repo,
+                "commit_sha": commit_sha,
+                "metric": metric,
+            },
+            "fields": {
+                "value": float(value),
+            },
+        })
+
+    return points
