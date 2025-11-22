@@ -13,13 +13,14 @@ from durinn_topic_drift import (
     kl_divergence,
     jaccard_drift,
     topic_heatmap_points,
-    topic_drift_points
+    topic_drift_points,
 )
-from durinn_enrichment import build_repo_enrichment  # <-- NEW
+from durinn_enrichment import build_repo_enrichment
 import uvicorn
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 from fastmcp import FastMCP
 from datetime import datetime
+import torch
 
 # ============================================================
 # CONFIG
@@ -30,6 +31,11 @@ BACKUP_DIR = os.getenv("MCP_BACKUP_DIR", ".mcp_backups")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 TSDB_API_KEY = os.getenv("TSDB_API_KEY")
 TSDB_ENDPOINT = os.getenv("TSDB_ENDPOINT")
+
+# Calibration critic (SFT model) – from rymarinelli/calibration
+CRITIC_MODEL_PATH = os.getenv("CRITIC_MODEL_PATH", "./calibration/tiny_security_critic")
+CRITIC_BASE_MODEL = os.getenv("CRITIC_BASE_MODEL", None)  # if you want to point at a base HF id
+
 
 # ============================================================
 # UTILITIES
@@ -101,7 +107,7 @@ def stable_uid(rule_id: str, file_path: str, f: dict) -> str:
 
     # fallback if no fingerprint exists
     start = (f.get("raw") or {}).get("start", {}).get("line", "")
-    end   = (f.get("raw") or {}).get("end", {}).get("line", "")
+    end = (f.get("raw") or {}).get("end", {}).get("line", "")
 
     h = hashlib.sha1()
     h.update((rule_id or "").encode())
@@ -136,7 +142,7 @@ def extract_vulns(snapshot: dict) -> Dict[str, dict]:
             "file": file_path,
             "code": code,
             "severity": severity,
-            "message": extra.get("message"),  # <-- NEW, used by enrichment
+            "message": extra.get("message"),  # used by enrichment
             # flatten fields you asked for
             "semgrep_fingerprint": extra.get("fingerprint"),
             "asvs": (extra.get("metadata") or {}).get("asvs"),
@@ -160,8 +166,7 @@ def compute_diff(prev: Dict[str, dict], curr: Dict[str, dict]) -> dict:
     }
 
 
-def update_ttf_store(ttf_path: str, commit_sha: str, timestamp: str,
-                     diff: dict):
+def update_ttf_store(ttf_path: str, commit_sha: str, timestamp: str, diff: dict):
     """
     ttf_store.json structure:
     {
@@ -255,46 +260,50 @@ def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
             timestamp=ts_iso,
             topics=topics,
             owner=owner,
-            repo=repo
+            repo=repo,
         )
         points.extend(topic_points)
     except Exception as e:
         print(f"[MCP] ⚠️ Topic heatmap generation failed: {e}")
 
     # ----- Summary point per commit -----
-    points.append({
-        "measurement": "vuln_commit_summary",
-        "time": ts_iso,
-        "tags": {
-            "owner": owner,
-            "repo": repo,
-            "commit_sha": commit_sha,
-        },
-        "fields": {
-            "total": int(stats.get("total", 0) or 0),
-            "added": int(stats.get("added", 0) or 0),
-            "removed": int(stats.get("removed", 0) or 0),
-            "persisted": int(stats.get("persisted", 0) or 0),
-        },
-    })
-
-    # ----- per-vuln point -----
-    for uid, v in vulns.items():
-        points.append({
-            "measurement": "vuln_state",
+    points.append(
+        {
+            "measurement": "vuln_commit_summary",
             "time": ts_iso,
             "tags": {
                 "owner": owner,
                 "repo": repo,
                 "commit_sha": commit_sha,
-                "vuln_uid": uid,
-                "rule_id": v.get("rule_id") or "",
-                "severity": v.get("severity") or "",
             },
             "fields": {
-                "is_present": 1,
+                "total": int(stats.get("total", 0) or 0),
+                "added": int(stats.get("added", 0) or 0),
+                "removed": int(stats.get("removed", 0) or 0),
+                "persisted": int(stats.get("persisted", 0) or 0),
             },
-        })
+        }
+    )
+
+    # ----- per-vuln point -----
+    for uid, v in vulns.items():
+        points.append(
+            {
+                "measurement": "vuln_state",
+                "time": ts_iso,
+                "tags": {
+                    "owner": owner,
+                    "repo": repo,
+                    "commit_sha": commit_sha,
+                    "vuln_uid": uid,
+                    "rule_id": v.get("rule_id") or "",
+                    "severity": v.get("severity") or "",
+                },
+                "fields": {
+                    "is_present": 1,
+                },
+            }
+        )
 
     # ----- Send all points -----
     headers = {"Content-Type": "application/json"}
@@ -310,16 +319,17 @@ def push_commit_report_to_timeseries(report: dict, owner: str, repo: str):
 
 
 def build_commit_report(
-        commit_sha: str,
-        timestamp: str,
-        curr_snapshot_path: str,
-        prev_snapshot_path: Optional[str],
-        ttf_store_path: str,
-        sandbox_path: str,
-        output_dir: str,
-        owner: str,
-        repo: str):
-
+    commit_sha: str,
+    timestamp: str,
+    curr_snapshot_path: str,
+    prev_snapshot_path: Optional[str],
+    ttf_store_path: str,
+    sandbox_path: str,
+    output_dir: str,
+    owner: str,
+    repo: str,
+    critic_result: Optional[dict] = None,
+):
     # ---- Extract vuln sets ----
     curr = extract_vulns(load_json(curr_snapshot_path))
     prev = extract_vulns(load_json(prev_snapshot_path)) if prev_snapshot_path else {}
@@ -328,12 +338,7 @@ def build_commit_report(
     diff = compute_diff(prev, curr)
 
     # ---- Time-to-fix store update ----
-    ttf_store = update_ttf_store(
-        ttf_store_path,
-        commit_sha,
-        timestamp,
-        diff
-    )
+    ttf_store = update_ttf_store(ttf_store_path, commit_sha, timestamp, diff)
 
     # ---- Topic modeling (current commit) ----
     topics = topic_model_vulns(curr)
@@ -352,10 +357,9 @@ def build_commit_report(
 
     topic_drift = {
         "jaccard": jaccard_drift(prev_topics, topics),
-        "kl_divergence": kl_divergence(prev_dist, curr_dist)
+        "kl_divergence": kl_divergence(prev_dist, curr_dist),
     }
 
-    # NOTE: Above trick is just to avoid accidental reuse; real code below:
     repo_enrichment = build_repo_enrichment(
         owner=owner,
         repo=repo,
@@ -378,7 +382,8 @@ def build_commit_report(
         "topics": topics,
         "topic_drift": topic_drift,
         "time_to_fix_store": ttf_store,
-        "enrichment": repo_enrichment,  # <-- NEW: repo-level enrichment per commit
+        "enrichment": repo_enrichment,  # repo-level enrichment per commit
+        "critic": critic_result or None,  # <-- NEW: calibration critic result per commit
     }
 
     # ---- Write commit report file ----
@@ -401,13 +406,15 @@ def build_snapshot_from_semgrep_results(results: List[dict]) -> dict:
     findings: List[dict] = []
     for r in results:
         extra = r.get("extra", {}) or {}
-        findings.append({
-            "rule_id": r.get("check_id"),
-            "file": r.get("path"),
-            "code_excerpt": extra.get("lines", "") or "",
-            "severity": extra.get("severity"),
-            "raw": r,
-        })
+        findings.append(
+            {
+                "rule_id": r.get("check_id"),
+                "file": r.get("path"),
+                "code_excerpt": extra.get("lines", "") or "",
+                "severity": extra.get("severity"),
+                "raw": r,
+            }
+        )
     return {
         "tool": "semgrep",
         "generated_at": datetime.utcnow().isoformat() + "Z",
@@ -416,9 +423,11 @@ def build_snapshot_from_semgrep_results(results: List[dict]) -> dict:
 
 
 # ============================================================
-# LLM PIPELINE
+# LLM PIPELINES (Magicoder + critic)
 # ============================================================
 _textgen = None
+
+
 def get_textgen():
     global _textgen
     if _textgen is None:
@@ -428,18 +437,87 @@ def get_textgen():
 
 def hf_remediation_from_findings(findings: List[dict]) -> str:
     textgen = get_textgen()
-    issues_txt = "\n".join(
-        f"- {f.get('check_id')}: {f.get('path')}:{(f.get('start') or {}).get('line')} – "
-        f"{(f.get('extra') or {}).get('message')}"
-        for f in findings
-    ) or "No issues."
+    issues_txt = (
+        "\n".join(
+            f"- {f.get('check_id')}: {f.get('path')}:{(f.get('start') or {}).get('line')} – "
+            f"{(f.get('extra') or {}).get('message')}"
+            for f in findings
+        )
+        or "No issues."
+    )
     prompt = (
         "You are a senior application security engineer. Based on the following Semgrep findings, "
         "write (1) a short risk summary, (2) prioritized remediation steps, and (3) example code/patterns.\n\n"
         f"Findings:\n{issues_txt}\n\nAnswer:\n"
     )
     out = textgen(prompt, max_new_tokens=256, do_sample=False)[0]["generated_text"]
-    return out[len(prompt):].strip() if out.startswith(prompt) else out
+    return out[len(prompt) :].strip() if out.startswith(prompt) else out
+
+
+# ----- calibration critic (SFT model from rymarinelli/calibration) -----
+_critic_model = None
+_critic_tokenizer = None
+
+
+def load_critic_model():
+    """
+    Load the calibration critic model once (tiny_security_critic).
+    Assumes CRITIC_MODEL_PATH points at a full HF model dir.
+    """
+    global _critic_model, _critic_tokenizer
+    if _critic_model is not None and _critic_tokenizer is not None:
+        return _critic_model, _critic_tokenizer
+
+    model_path = CRITIC_MODEL_PATH
+    base_model_name = CRITIC_BASE_MODEL or model_path
+
+    print(f"[MCP] Loading critic model from: {model_path} (base: {base_model_name})")
+    model = AutoModelForCausalLM.from_pretrained(base_model_name, device_map="auto")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    _critic_model = model
+    _critic_tokenizer = tokenizer
+    return model, tokenizer
+
+
+def critic_classify(prompt: str) -> dict:
+    """
+    Run the calibration critic on a prompt describing:
+      - rule id
+      - file
+      - original line
+      - sandbox stdout/stderr
+
+    Expected format of SFT outputs (but we’re robust):
+      LABEL: <secure|insecure|unknown>
+      REASON: <short rationale>
+    """
+    model, tokenizer = load_critic_model()
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=200,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+
+    label = "unknown"
+    lower = text.lower()
+    head = lower[:120]
+    if "label: secure" in head:
+        label = "secure"
+    elif "label: insecure" in head:
+        label = "insecure"
+    elif "secure" in head and "insecure" not in head:
+        label = "secure"
+    elif "insecure" in head:
+        label = "insecure"
+
+    return {
+        "label": label,
+        "raw_output": text.strip(),
+    }
 
 
 # ============================================================
@@ -454,6 +532,7 @@ def register_tool(name: str):
         mcp.tool(name=name)(func)
         TOOL_REGISTRY[name] = func
         return func
+
     return decorator
 
 
@@ -474,19 +553,35 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str, prompt: st
     # Clone sandbox (retry with token if necessary)
     SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN")
     try:
-        subprocess.run(["git", "clone", sandbox_repo_url, sandbox_dir], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "clone", sandbox_repo_url, sandbox_dir],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     except subprocess.CalledProcessError:
         token = os.getenv("GITHUB_TOKEN")
         if token:
             authed_url = sandbox_repo_url.replace("https://", f"https://{token}@")
-            subprocess.run(["git", "clone", authed_url, sandbox_dir], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "clone", authed_url, sandbox_dir],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         else:
             raise
 
     # Install deps if present
     req = os.path.join(sandbox_dir, "requirements-dev.txt")
     if os.path.exists(req):
-        subprocess.run(["pip", "install", "-r", "requirements-dev.txt"], cwd=sandbox_dir, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["pip", "install", "-r", "requirements-dev.txt"],
+            cwd=sandbox_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     # Run inspection
     json_path = os.path.join(repo_dir, f"sandbox_report_{ts_suffix}.json")
@@ -500,8 +595,10 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str, prompt: st
 
     proc = subprocess.run(
         [
-            "python", "scripts/inspect_vibe_code.py",
-            "--workspace", repo_dir,
+            "python",
+            "scripts/inspect_vibe_code.py",
+            "--workspace",
+            repo_dir,
             "--prompt",
             user_prompt_path,
             "--fail-on-high",
@@ -522,7 +619,7 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str, prompt: st
             url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-sandbox"
             headers = {
                 "Authorization": f"Bearer {SUPABASE_TOKEN}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
             requests.post(url, headers=headers)
         except requests.exceptions.RequestException as e:
@@ -552,7 +649,7 @@ def run_sandbox_inspect(repo_dir: str, tmp_root: str, ts_suffix: str, prompt: st
         url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-prompts"
         headers = {
             "Authorization": f"Bearer {SUPABASE_TOKEN}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
         requests.post(url, headers=headers)
     except requests.exceptions.RequestException as e:
@@ -600,6 +697,8 @@ def scan_github_repo(
     commit_reports_dir = os.path.join(durinn_meta_dir, "commit_reports")
     ttf_store_path = os.path.join(durinn_meta_dir, "time_to_fix.json")
 
+    last_critic_result: Optional[dict] = None
+
     try:
         repo_url_webhook = re.sub(r"^https://github\.com/", "", repo_url).replace(".git", "").strip("/")
         requests.post(
@@ -608,8 +707,8 @@ def scan_github_repo(
             json={
                 "repo": repo_url_webhook,
                 "type": "status",
-                "data": {"step": "auth", "message": "Authenticating GitHub user..."}
-            }
+                "data": {"step": "auth", "message": "Authenticating GitHub user..."},
+            },
         )
 
         # --- clone ---
@@ -617,14 +716,8 @@ def scan_github_repo(
         owner, repo = parts[-2], parts[-1]
         clone_url = (
             f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{repo}.git"
-            if GITHUB_TOKEN else
-            f"https://github.com/{owner}/{repo}.git"
-        )
-
-        requests.post(
-            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
-            headers={"Content-Type": "application/json"},
-            json={"repo": repo_url_webhook, "type": "status", "data": {"step": "scan", "message": "Analyzing project structure..."}}
+            if GITHUB_TOKEN
+            else f"https://github.com/{owner}/{repo}.git"
         )
 
         requests.post(
@@ -633,13 +726,24 @@ def scan_github_repo(
             json={
                 "repo": repo_url_webhook,
                 "type": "status",
-                "data": {"step": "context", "message": "Cloning repository for analysis..."}
-            }
+                "data": {"step": "scan", "message": "Analyzing project structure..."},
+            },
+        )
+
+        requests.post(
+            "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+            headers={"Content-Type": "application/json"},
+            json={
+                "repo": repo_url_webhook,
+                "type": "status",
+                "data": {"step": "context", "message": "Cloning repository for analysis..."},
+            },
         )
         for branch_try in (base_branch, "master"):
             clone_proc = subprocess.run(
                 ["git", "clone", "--depth", "1", "--branch", branch_try, clone_url, repo_dir],
-                capture_output=True, text=True
+                capture_output=True,
+                text=True,
             )
             if clone_proc.returncode == 0:
                 base_branch = branch_try
@@ -659,16 +763,26 @@ def scan_github_repo(
             json={
                 "repo": repo_url_webhook,
                 "type": "status",
-                "data": {"step": "scan", "message": "Scanning project for security issues..."}
-            }
+                "data": {"step": "scan", "message": "Scanning project for security issues..."},
+            },
         )
 
         # --- semgrep (initial scan baseline) ---
         semgrep_cmd = [
-            "semgrep", "scan", "--json",
-            "--exclude", "node_modules", "--exclude", ".npm", "--exclude", "__pycache__", "--exclude", ".venv",
-            "--config", ("auto" if quick else semgrep_config),
-            repo_dir
+            "semgrep",
+            "scan",
+            "--json",
+            "--exclude",
+            "node_modules",
+            "--exclude",
+            ".npm",
+            "--exclude",
+            "__pycache__",
+            "--exclude",
+            ".venv",
+            "--config",
+            ("auto" if quick else semgrep_config),
+            repo_dir,
         ]
         semgrep_proc = subprocess.run(semgrep_cmd, capture_output=True, text=True)
         try:
@@ -687,7 +801,11 @@ def scan_github_repo(
         requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
-            json={"repo": repo_url_webhook, "type": "status", "data": {"step": "analyze", "message": findings_message}}
+            json={
+                "repo": repo_url_webhook,
+                "type": "status",
+                "data": {"step": "analyze", "message": findings_message},
+            },
         )
         remediation_text = hf_remediation_from_findings(findings) if llm_proposal else ""
 
@@ -697,7 +815,7 @@ def scan_github_repo(
         subprocess.run(["git", "checkout", "-b", branch_name], cwd=repo_dir, check=True)
 
         # --- remediation loop (sandbox BEFORE each commit) ---
-        def apply_llm_fix_to_file(finding: dict) -> Optional[tuple[str, str]]:
+        def apply_llm_fix_to_file(finding: dict) -> Optional[tuple[str, str, str]]:
             rel_path = finding.get("path")
             if not rel_path:
                 return None
@@ -709,7 +827,6 @@ def scan_github_repo(
             if not line_no:
                 return None
 
-            # default empty prompt; we will fill when calling LLM
             prompt = ""
 
             try:
@@ -732,7 +849,7 @@ def scan_github_repo(
                     "Return ONLY the corrected code. Do not explain.\n"
                 )
                 out = textgen(prompt, max_new_tokens=80, do_sample=False)[0]["generated_text"]
-                fixed_line = out[len(prompt):].strip() or None
+                fixed_line = out[len(prompt) :].strip() or None
                 if not fixed_line:
                     return None
             except Exception:
@@ -748,17 +865,21 @@ def scan_github_repo(
             ]
 
             try:
-                lines[line_no - 1:line_no] = block
+                lines[line_no - 1 : line_no] = block
                 with open(target_file, "w", encoding="utf-8") as f:
                     f.writelines(lines)
-                return rel_path, prompt
+                return rel_path, prompt, vuln_line
             except Exception:
                 return None
 
         requests.post(
             "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
             headers={"Content-Type": "application/json"},
-            json={"repo": repo_url_webhook, "type": "status", "data": {"step": "risk", "message": "Generating remediation plan..."}}
+            json={
+                "repo": repo_url_webhook,
+                "type": "status",
+                "data": {"step": "risk", "message": "Generating remediation plan..."},
+            },
         )
 
         applied = 0
@@ -767,7 +888,7 @@ def scan_github_repo(
             result = apply_llm_fix_to_file(fnd)
             if not result:
                 continue
-            rel_path, prompt = result
+            rel_path, prompt, vuln_line = result
 
             # 🔒 SANDBOX BEFORE REMEDIATION COMMIT — always commit a report (success/fail)
             ts_suffix = f"{branch_name.split('mcp/remediation-')[-1]}-{applied+1:03d}"
@@ -787,12 +908,15 @@ def scan_github_repo(
 
                 # --- webhook: sandbox commit ---
                 try:
-                    sha_sbx = subprocess.run(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=repo_dir,
-                        capture_output=True,
-                        text=True
-                    ).stdout.strip()
+                    sha_sbx = (
+                        subprocess.run(
+                            ["git", "rev-parse", "HEAD"],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            text=True,
+                        )
+                        .stdout.strip()
+                    )
                     requests.post(
                         "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
                         headers={"Content-Type": "application/json"},
@@ -836,6 +960,62 @@ def scan_github_repo(
                     f.write(f"# Sandbox Inspection Error ({ts_suffix})\n\n```\n{masked_trace}\n```\n")
                 sbx = {"status": "error", "returncode": 99, "md_path": fail_md}
 
+            # === Calibration critic on sandboxed remediation ===
+            critic_prompt = (
+                "You are a security code critic.\n"
+                "Evaluate whether the remediation is SECURE.\n"
+                "Output format:\n"
+                "LABEL: <secure|insecure|unknown>\n"
+                "REASON: <short rationale>\n\n"
+                f"Rule: {fnd.get('check_id','semgrep_rule')}\n"
+                f"File: {rel_path}\n\n"
+                "=== ORIGINAL LINE ===\n"
+                f"{vuln_line}\n\n"
+                "=== SANDBOX OUTPUT ===\n"
+                f"{(sbx.get('stdout','') or '')[:4000]}\n"
+                f"{(sbx.get('stderr','') or '')[:4000]}\n"
+                "=== END ===\n"
+            )
+            try:
+                critic_result = critic_classify(critic_prompt)
+            except Exception as e:
+                print(f"[MCP] ⚠️ Critic failed: {e}")
+                critic_result = {"label": "unknown", "raw_output": f"critic_error: {e}"}
+
+            last_critic_result = critic_result
+
+            # Persist critic judgement as artifact
+            critic_path = os.path.join(repo_dir, f"critic_report_{ts_suffix}.json")
+            write_json(critic_path, critic_result)
+            subprocess.run(["git", "add", critic_path], cwd=repo_dir, check=False)
+
+            # Webhook: critic status (for UI timeline)
+            try:
+                sha_sbx = (
+                    subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        text=True,
+                    )
+                    .stdout.strip()
+                )
+                requests.post(
+                    "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "repo": repo_url_webhook,
+                        "type": "critic",
+                        "data": {
+                            "label": critic_result.get("label", "unknown"),
+                            "commit": sha_sbx,
+                            "summary": critic_result.get("raw_output", "")[:300],
+                        },
+                    },
+                )
+            except Exception as e:
+                print(f"⚠️ Critic webhook failed: {e}")
+
             # Now commit the actual remediation for this file
             check_id = fnd.get("check_id", "semgrep_rule")
             msg = f"Auto remediation: {rel_path} ({check_id})"
@@ -843,14 +1023,17 @@ def scan_github_repo(
             subprocess.run(["git", "add", rel_path], cwd=repo_dir)
             subprocess.run(["git", "commit", "-m", msg], cwd=repo_dir)
 
-            # 🔗 COMMIT-LEVEL VULN NODE FOR THIS REMEDIATION COMMIT
+            # 🔗 COMMIT-LEVEL VULN NODE FOR THIS REMEDIATION COMMIT (incl. critic)
             try:
-                sha = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True
-                ).stdout.strip()
+                sha = (
+                    subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        text=True,
+                    )
+                    .stdout.strip()
+                )
 
                 # re-run semgrep to see current vuln state at this commit
                 post_semgrep_proc = subprocess.run(semgrep_cmd, capture_output=True, text=True)
@@ -874,6 +1057,7 @@ def scan_github_repo(
                     output_dir=commit_reports_dir,
                     owner=owner,
                     repo=repo,
+                    critic_result=critic_result,
                 )
                 prev_snapshot_path = curr_snapshot_path
 
@@ -924,13 +1108,15 @@ def scan_github_repo(
             )
             if repo_level_enrichment:
                 after = repo_level_enrichment.get("after") or {}
-                sev = (after.get("severity_counts") or {})
+                sev = after.get("severity_counts") or {}
                 err = sev.get("ERROR", 0)
                 warn = sev.get("WARNING", 0)
                 tags = repo_level_enrichment.get("semantic", {}).get("owasp_tags", [])
 
                 f.write("## Risk profile\n\n")
-                f.write(f"- Risk label: **{repo_level_enrichment.get('flag_status', 'unknown')}**\n")
+                f.write(
+                    f"- Risk label (heuristic): **{repo_level_enrichment.get('flag_status', 'unknown')}**\n"
+                )
                 f.write(
                     f"- Total findings (current scan): {after.get('total_findings', 0)} "
                     f"(ERROR: {err}, WARNING: {warn})\n"
@@ -944,11 +1130,11 @@ def scan_github_repo(
                 if rule_expl:
                     f.write("### Top rule drivers\n\n")
                     # sort by rule count descending
-                    rule_counts = (after.get("rule_counts") or {})
+                    rule_counts = after.get("rule_counts") or {}
                     top_rules = sorted(
                         rule_counts.items(),
                         key=lambda kv: kv[1],
-                        reverse=True
+                        reverse=True,
                     )[:5]
                     for rule_id, cnt in top_rules:
                         expl = rule_expl.get(rule_id, "")
@@ -958,7 +1144,15 @@ def scan_github_repo(
             # Append remediation_text from HF model if requested
             if remediation_text:
                 f.write("## LLM Remediation Plan\n\n")
-                f.write(remediation_text.strip() + "\n")
+                f.write(remediation_text.strip() + "\n\n")
+
+            # Latest critic judgement (from the last remediation commit)
+            if last_critic_result:
+                f.write("## Security Critic (Calibrated SFT)\n\n")
+                f.write(f"- Latest label: **{last_critic_result.get('label','unknown')}**\n\n")
+                f.write("```text\n")
+                f.write(last_critic_result.get("raw_output", "").strip()[:2000])
+                f.write("\n```\n")
 
         print(f"git add MCP Security Report\n\nTarget: {repo_url}\nTime: {ts_branch}\n")
         subprocess.run(["git", "add", report_path], cwd=repo_dir)
@@ -968,7 +1162,7 @@ def scan_github_repo(
         if repo_level_enrichment:
             try:
                 after = repo_level_enrichment.get("after") or {}
-                sev = (after.get("severity_counts") or {})
+                sev = after.get("severity_counts") or {}
                 err = sev.get("ERROR", 0)
                 warn = sev.get("WARNING", 0)
                 tags = repo_level_enrichment.get("semantic", {}).get("owasp_tags", [])
@@ -1014,21 +1208,32 @@ def scan_github_repo(
             # Enriched risk profile inline in PR body
             if repo_level_enrichment:
                 after = repo_level_enrichment.get("after") or {}
-                sev = (after.get("severity_counts") or {})
+                sev = after.get("severity_counts") or {}
                 err = sev.get("ERROR", 0)
                 warn = sev.get("WARNING", 0)
                 tags = repo_level_enrichment.get("semantic", {}).get("owasp_tags", [])
 
-                md_lines.extend([
-                    "",
-                    "## Risk profile",
-                    f"- Risk label: **{repo_level_enrichment.get('flag_status', 'unknown')}**",
-                    (
-                        f"- Total findings (current scan): {after.get('total_findings', 0)} "
-                        f"(ERROR: {err}, WARNING: {warn})"
-                    ),
-                    (f"- OWASP tags: {', '.join(tags[:8])}" if tags else ""),
-                ])
+                md_lines.extend(
+                    [
+                        "",
+                        "## Risk profile",
+                        f"- Risk label (heuristic): **{repo_level_enrichment.get('flag_status', 'unknown')}**",
+                        (
+                            f"- Total findings (current scan): {after.get('total_findings', 0)} "
+                            f"(ERROR: {err}, WARNING: {warn})"
+                        ),
+                        (f"- OWASP tags: {', '.join(tags[:8])}" if tags else ""),
+                    ]
+                )
+
+            if last_critic_result:
+                md_lines.extend(
+                    [
+                        "",
+                        "## Security Critic (Calibrated SFT)",
+                        f"- Latest label: **{last_critic_result.get('label','unknown')}**",
+                    ]
+                )
 
             pr_body = "\n".join([l for l in md_lines if l is not None])
 
@@ -1092,7 +1297,7 @@ def scan_github_repo(
             url = "https://psogrrrvxrqxnuhcbvlm.supabase.co/functions/v1/increment-scan"
             headers = {
                 "Authorization": f"Bearer {SUPABASE_TOKEN}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
             requests.post(url, headers=headers)
         except requests.exceptions.RequestException as e:

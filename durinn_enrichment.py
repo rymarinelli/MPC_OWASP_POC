@@ -1,7 +1,6 @@
-%%writefile durinn_enrichment.py
 # durinn_enrichment.py
 from __future__ import annotations
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 from collections import Counter, defaultdict
 import re
 
@@ -31,6 +30,7 @@ def _normalize_owasp(value):
     if isinstance(value, str):
         return [value]
     return []
+
 
 def _aggregate_vulns(vulns: Dict[str, dict]) -> Dict[str, Any]:
     """
@@ -78,7 +78,7 @@ def _diff_aggregates(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str,
 
 def _label_risk(agg: Dict[str, Any]) -> str:
     """
-    Very simple risk label strategy, aligned with dataset vocabulary:
+    Simple heuristic risk label strategy, aligned with dataset vocabulary:
       - 'high'    : many ERRORs or very large total
       - 'flagged' : any findings but not 'high'
       - 'clean'   : no findings
@@ -204,48 +204,42 @@ def build_repo_enrichment(
     repo: str,
     prev_vulns: Dict[str, dict] | None,
     curr_vulns: Dict[str, dict],
+    ml_risk_score: Optional[float] = None,
+    ml_risk_label: Optional[str] = None,
+    ml_persistence: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
     Build a repo-level enrichment payload shaped like your
     Durinn_Hacktoberfest_Retrospective dataset entries.
 
-    Parameters
-    ----------
-    owner, repo:
-        GitHub coordinates, e.g. 'victorstrandmoe97', 'vanguard-ai-sparkle-30958'
-    prev_vulns:
-        Vulnerabilities from the earlier snapshot (can be None or empty).
-    curr_vulns:
-        Vulnerabilities from the current snapshot.
-
-    Returns
-    -------
-    dict with keys similar to the dataset:
-      - repo              (string 'owner/repo')
-      - before            (aggregate dict, omitted if prev_vulns empty)
-      - after             (aggregate dict)
-      - diff              (delta between before/after if before present)
-      - flag_status       ('clean' | 'flagged' | 'high')
-      - semantic          ({ 'owasp_tags': [...] })
-      - rule_explanations ({ rule_id: narrative })
+    ml_* fields are optional hooks where the calibration critic (or a future
+    model trained from commit_report_*.json) can inject:
+      - ml_risk_score: float 0–1
+      - ml_risk_label: 'low'|'medium'|'high'|'unknown'
+      - ml_persistence: { vuln_uid: probability_it_persists }
     """
     prev_vulns = prev_vulns or {}
     before_agg = _aggregate_vulns(prev_vulns) if prev_vulns else None
     after_agg = _aggregate_vulns(curr_vulns)
     diff = _diff_aggregates(before_agg, after_agg) if before_agg else None
-    flag_status = _label_risk(after_agg)
 
+    heuristic_flag = _label_risk(after_agg)
     rule_explanations = _build_rule_explanations(curr_vulns)
 
     enrichment: Dict[str, Any] = {
         "type": "repo",
         "repo": f"{owner}/{repo}",
-        "flag_status": flag_status,
+        "flag_status": heuristic_flag,
         "after": after_agg,
         "semantic": {
             "owasp_tags": after_agg.get("owasp_tags", []),
         },
         "rule_explanations": rule_explanations,
+        "ml": {
+            "risk_score": ml_risk_score,
+            "risk_label": ml_risk_label,
+            "persistence": ml_persistence or {},
+        },
     }
 
     if before_agg is not None:
