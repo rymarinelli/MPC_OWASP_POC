@@ -1,4 +1,5 @@
 %%writefile mcp_server.py
+# mcp_server.py
 from pathlib import Path
 import re
 from typing import Optional, Dict, Any, List, Callable
@@ -14,6 +15,7 @@ from durinn_topic_drift import (
     topic_heatmap_points,
     topic_drift_points
 )
+from durinn_enrichment import build_repo_enrichment  # <-- NEW
 import uvicorn
 from transformers import pipeline
 from fastmcp import FastMCP
@@ -107,10 +109,12 @@ def stable_uid(rule_id: str, file_path: str, f: dict) -> str:
     h.update(f"{start}-{end}".encode())
     return h.hexdigest()
 
+
 def extract_vulns(snapshot: dict) -> Dict[str, dict]:
     """
     Extract normalized vulnerabilities from an MCP scan snapshot.
-    FLATTEN Semgrep metadata → keep only minimal fields needed for analytics.
+    FLATTEN Semgrep metadata → keep only minimal fields needed for analytics
+    and enrichment.
     """
     vulns: Dict[str, dict] = {}
 
@@ -132,6 +136,7 @@ def extract_vulns(snapshot: dict) -> Dict[str, dict]:
             "file": file_path,
             "code": code,
             "severity": severity,
+            "message": extra.get("message"),  # <-- NEW, used by enrichment
             # flatten fields you asked for
             "semgrep_fingerprint": extra.get("fingerprint"),
             "asvs": (extra.get("metadata") or {}).get("asvs"),
@@ -143,6 +148,7 @@ def extract_vulns(snapshot: dict) -> Dict[str, dict]:
 
     return vulns
 
+
 def compute_diff(prev: Dict[str, dict], curr: Dict[str, dict]) -> dict:
     prev_set = set(prev.keys())
     curr_set = set(curr.keys())
@@ -152,6 +158,7 @@ def compute_diff(prev: Dict[str, dict], curr: Dict[str, dict]) -> dict:
         "removed": list(prev_set - curr_set),
         "persisted": list(curr_set & prev_set),
     }
+
 
 def update_ttf_store(ttf_path: str, commit_sha: str, timestamp: str,
                      diff: dict):
@@ -348,6 +355,14 @@ def build_commit_report(
         "kl_divergence": kl_divergence(prev_dist, curr_dist)
     }
 
+    # NOTE: Above trick is just to avoid accidental reuse; real code below:
+    repo_enrichment = build_repo_enrichment(
+        owner=owner,
+        repo=repo,
+        prev_vulns=prev,
+        curr_vulns=curr,
+    )
+
     # ---- Build final report JSON ----
     report = {
         "commit_sha": commit_sha,
@@ -363,6 +378,7 @@ def build_commit_report(
         "topics": topics,
         "topic_drift": topic_drift,
         "time_to_fix_store": ttf_store,
+        "enrichment": repo_enrichment,  # <-- NEW: repo-level enrichment per commit
     }
 
     # ---- Write commit report file ----
@@ -413,7 +429,8 @@ def get_textgen():
 def hf_remediation_from_findings(findings: List[dict]) -> str:
     textgen = get_textgen()
     issues_txt = "\n".join(
-        f"- {f.get('check_id')}: {f.get('path')}:{(f.get('start') or {}).get('line')} – {(f.get('extra') or {}).get('message')}"
+        f"- {f.get('check_id')}: {f.get('path')}:{(f.get('start') or {}).get('line')} – "
+        f"{(f.get('extra') or {}).get('message')}"
         for f in findings
     ) or "No issues."
     prompt = (
@@ -745,6 +762,7 @@ def scan_github_repo(
         )
 
         applied = 0
+
         for fnd in findings[:50]:
             result = apply_llm_fix_to_file(fnd)
             if not result:
@@ -880,17 +898,97 @@ def scan_github_repo(
                 "num_findings": len(findings),
             }
 
+        # ---------- FINAL REPO-LEVEL ENRICHMENT (baseline vs last snapshot) ----------
+        try:
+            baseline_vulns = extract_vulns(baseline_snapshot)
+            final_snapshot = load_json(prev_snapshot_path or baseline_snapshot_path)
+            final_vulns = extract_vulns(final_snapshot)
+
+            repo_level_enrichment = build_repo_enrichment(
+                owner=owner,
+                repo=repo,
+                prev_vulns=baseline_vulns,
+                curr_vulns=final_vulns,
+            )
+        except Exception as e:
+            print(f"[MCP] ⚠️ Failed to build final repo-level enrichment: {e}")
+            repo_level_enrichment = None
+
         # --- overall report file (after fixes) ---
         report_path = os.path.join(repo_dir, "MCP_SECURITY_REPORT.md")
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(
-                f"# MCP Security Report\n\nTarget: {repo_url}\nTime: {ts_branch}\n"
-                f"Findings: {len(findings)}\nPatched: {applied}\n\n{remediation_text}\n"
+                f"# MCP Security Report\n\n"
+                f"Target: {repo_url}\nTime: {ts_branch}\n"
+                f"Findings: {len(findings)}\nPatched: {applied}\n\n"
             )
+            if repo_level_enrichment:
+                after = repo_level_enrichment.get("after") or {}
+                sev = (after.get("severity_counts") or {})
+                err = sev.get("ERROR", 0)
+                warn = sev.get("WARNING", 0)
+                tags = repo_level_enrichment.get("semantic", {}).get("owasp_tags", [])
+
+                f.write("## Risk profile\n\n")
+                f.write(f"- Risk label: **{repo_level_enrichment.get('flag_status', 'unknown')}**\n")
+                f.write(
+                    f"- Total findings (current scan): {after.get('total_findings', 0)} "
+                    f"(ERROR: {err}, WARNING: {warn})\n"
+                )
+                if tags:
+                    f.write(f"- OWASP tags: {', '.join(tags[:8])}\n")
+                f.write("\n")
+
+                # Optional: include top rule explanations inline (shortened)
+                rule_expl = repo_level_enrichment.get("rule_explanations") or {}
+                if rule_expl:
+                    f.write("### Top rule drivers\n\n")
+                    # sort by rule count descending
+                    rule_counts = (after.get("rule_counts") or {})
+                    top_rules = sorted(
+                        rule_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True
+                    )[:5]
+                    for rule_id, cnt in top_rules:
+                        expl = rule_expl.get(rule_id, "")
+                        f.write(f"- **{rule_id}** ({cnt} finding(s)): {expl}\n")
+                    f.write("\n")
+
+            # Append remediation_text from HF model if requested
+            if remediation_text:
+                f.write("## LLM Remediation Plan\n\n")
+                f.write(remediation_text.strip() + "\n")
 
         print(f"git add MCP Security Report\n\nTarget: {repo_url}\nTime: {ts_branch}\n")
         subprocess.run(["git", "add", report_path], cwd=repo_dir)
         subprocess.run(["git", "commit", "-m", "Add MCP security report"], cwd=repo_dir)
+
+        # --- WebSocket: repo-level risk status (Lovable step: '5. Risk Assessment') ---
+        if repo_level_enrichment:
+            try:
+                after = repo_level_enrichment.get("after") or {}
+                sev = (after.get("severity_counts") or {})
+                err = sev.get("ERROR", 0)
+                warn = sev.get("WARNING", 0)
+                tags = repo_level_enrichment.get("semantic", {}).get("owasp_tags", [])
+                msg = (
+                    f"Risk label: {repo_level_enrichment.get('flag_status', 'unknown')} – "
+                    f"{after.get('total_findings', 0)} findings "
+                    f"(ERROR: {err}, WARNING: {warn}); "
+                    f"OWASP tags: {', '.join(tags[:5])}"
+                )
+                requests.post(
+                    "https://beczmeknbeejgbaskdkc.supabase.co/functions/v1/scan-webhook",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "repo": repo_url_webhook,
+                        "type": "status",
+                        "data": {"step": "risk", "message": msg},
+                    },
+                )
+            except Exception as e:
+                print(f"[MCP] ⚠️ Risk websocket update failed: {e}")
 
         # push (PR happens next)
         subprocess.run(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_dir, check=False)
@@ -912,7 +1010,27 @@ def scan_github_repo(
                 "## Reports",
                 f"- `{os.path.basename(report_path)}`",
             ]
-            pr_body = "\n".join(md_lines)
+
+            # Enriched risk profile inline in PR body
+            if repo_level_enrichment:
+                after = repo_level_enrichment.get("after") or {}
+                sev = (after.get("severity_counts") or {})
+                err = sev.get("ERROR", 0)
+                warn = sev.get("WARNING", 0)
+                tags = repo_level_enrichment.get("semantic", {}).get("owasp_tags", [])
+
+                md_lines.extend([
+                    "",
+                    "## Risk profile",
+                    f"- Risk label: **{repo_level_enrichment.get('flag_status', 'unknown')}**",
+                    (
+                        f"- Total findings (current scan): {after.get('total_findings', 0)} "
+                        f"(ERROR: {err}, WARNING: {warn})"
+                    ),
+                    (f"- OWASP tags: {', '.join(tags[:8])}" if tags else ""),
+                ])
+
+            pr_body = "\n".join([l for l in md_lines if l is not None])
 
             headers = {
                 "Authorization": f"Bearer {GITHUB_TOKEN}",
