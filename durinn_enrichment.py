@@ -22,6 +22,16 @@ def _owasp_name_to_tag(name: str) -> Optional[str]:
     return f"a{idx}-{year}".lower()
 
 
+def _normalize_owasp(value):
+    """Ensure owasp metadata is always returned as a list of strings."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [value]
+    return []
+
 def _aggregate_vulns(vulns: Dict[str, dict]) -> Dict[str, Any]:
     """
     Aggregate flattened Semgrep vulns (output of extract_vulns) into
@@ -38,7 +48,8 @@ def _aggregate_vulns(vulns: Dict[str, dict]) -> Dict[str, Any]:
         rule_counts[rule_id] += 1
         severity_counts[severity] += 1
 
-        for o_name in v.get("owasp") or []:
+        owasp_raw = _normalize_owasp(v.get("owasp"))
+        for o_name in owasp_raw:
             owasp_counts[o_name] += 1
             tag = _owasp_name_to_tag(o_name)
             if tag:
@@ -166,7 +177,8 @@ def _build_rule_explanations(vulns: Dict[str, dict]) -> Dict[str, str]:
             continue
 
         sample = items[0]
-        owasp_names = sample.get("owasp") or []
+        owasp_names = _normalize_owasp(sample.get("owasp"))
+
         owasp_name = owasp_names[0] if owasp_names else None
         severity = (sample.get("severity") or "UNKNOWN").upper()
         msg = (sample.get("message") or "").strip()
