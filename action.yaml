@@ -1,0 +1,51 @@
+name: "Durinn MCP Scan"
+description: "Runs the Durinn MCP workflow by invoking the MCP server via POST /call_tool."
+author: "Victor Strandmoe"
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  mcp_url:
+    description: "Base URL of your MCP server (Cloudflare tunnel URL)."
+    required: true
+  repo_url:
+    description: "URL of the GitHub repository to scan."
+    required: true
+  semgrep_config:
+    description: "Semgrep config to use."
+    required: false
+    default: "p/ci"
+  quick:
+    description: "Run Semgrep in quick mode."
+    required: false
+    default: "true"
+  create_pr:
+    description: "Automatically create PRs for fixes."
+    required: false
+    default: "true"
+  base_branch:
+    description: "Base branch for PR generation."
+    required: false
+    default: "main"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Durinn MCP scan
+      shell: bash
+      run: |
+        echo "Running MCP workflow…"
+
+        curl -X POST "${{ inputs.mcp_url }}/call_tool" \
+          -H "Content-Type: application/json" \
+          -d '{
+                "tool_name":"scan_github_repo",
+                "params":{
+                  "repo_url":"${{ inputs.repo_url }}",
+                  "semgrep_config":"${{ inputs.semgrep_config }}",
+                  "quick": '${{ inputs.quick }}',
+                  "create_pr": '${{ inputs.create_pr }}',
+                  "base_branch":"${{ inputs.base_branch }}"
+                }
+              }'
